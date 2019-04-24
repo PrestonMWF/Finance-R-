@@ -1,0 +1,360 @@
+---
+title: "Regression with Stationary Residuals and Cointegration using Financial Data"
+author: "Mark Preston"
+date: "February 15, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+###Time Series Analysis of Moody's AAA and BAA Bond Yields
+
+This week, I'll be examining Moody's AAA and BAA bond yields using time series modelling. Specifically, this will include regression with stationary residuals and cointegration as well. These bond classes have different risk-ratings. AAA is the highest issuers rating while BAA is more risky but, still relatively low-risk. BAA is still a lower grade bond though given it's only one rating above a junk bond. To start the yields analysis, I've loaded the necessary packages and data.
+
+```{r loaidng data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(TSA)
+library(tseries)
+library(urca)
+library(fArma)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+colours <- c("dodgerblue2", "darkorange", "darkorchid3", "forestgreen")
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+moodys_aaa <- read.csv("MYieldsData.csv") %>%
+  mutate(log_AAA = log(AAAyield),
+         log_BAA = log(BAAyield))
+
+moodys_aaa %>%
+  head() %>%
+  custom_kable()
+```
+
+I didn't like the date column in the initial set so I've transformed it into a formal date format. This will assist with the time series plotting.
+
+```{r date transform}
+moodys_aaa <- moodys_aaa %>%
+  mutate(Date = seq.Date(from = as.Date("1919/01/1"), 
+                         to = as.Date("2011/11/01"), 
+                         by = "month"))
+  
+moodys_aaa %>%
+  head() %>%
+  custom_kable()  
+```
+
+***
+
+###Exploratory Analysis of Moody's Bonds
+
+The initial time series plot shows that both the AAA and BAA bonds are very closely related. The yields aren't perfectly congruent but, they move in the same general pattern. Of note, the BAA bonds seem to have higher yields, which makes sense given they inherently involve more risk.
+
+```{r time series plots for bond yields}
+moodys_aaa %>%
+  gather(key = "yield_type", value = "value", -Date) %>%
+  mutate(series = ifelse(grepl(pattern = "log", x = yield_type), "log", "non-log"),
+         series = factor(series, levels = c("non-log", "log"))) %>%
+  ggplot(aes(Date, value, colour = yield_type)) +
+  geom_line(size = 1.3, alpha = .7) +
+  facet_wrap(facets = "series", scales = "free") +
+  scale_colour_manual(values = colours) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Time series for AAA and BAA Moody's bond yields and log yields from 1919-2011",
+       subtitle = "Yields for both bond classes move together and look very congruent")
+```
+
+To formalize the association, I've constructed the Pearson correlation coefficient for the log and normal yield values. As seen, they have very high correlation with both coefficients being over .95. 
+
+```{r moodys corr}
+data.frame(
+  yield = c("AAA/BAA", "log_AAA/log_BAA"),
+  correlation = c(
+    cor(moodys_aaa$AAAyield, moodys_aaa$BAAyield) %>% round(3),
+    cor(moodys_aaa$log_AAA, moodys_aaa$log_BAA) %>% round(3)
+  )
+) %>% custom_kable()
+```
+
+However a scatterplot of the log yields for both bond classes is revealing. While the relationship is broadly linear with a strong positive correlation, there are gaps in the series. These are essentially variance pockets where the values do not align. This means that any linear regression model should show residuals with a pattern, a clear violation of the IID residual assumption.
+
+```{r scatterplot for log yield}
+moodys_aaa %>%
+  ggplot(aes(log_BAA, log_AAA)) +
+  geom_jitter(size = 2.5, alpha = .5, colour = "dodgerblue2") +
+  geom_smooth(method = "lm", size = 1.3, colour = "darkorchid") +
+  labs(title = "Scatterplot for log AAA and BAA Moody's bond yields from 1919-2011",
+       subtitle = "Visualization highlights variance between bond class log yields- linear model not suitable for series")
+```
+
+***
+
+###Bond Yield Regression
+
+The initial regression model for both bonds with AAA yield as the outcome shows a very significant positive relationship between the classes. The BAA slope coefficient is highly significant with a t-value at about 111. The model's $R^2$ suggests that BAA explains about 92% of the variance in AAA yields. However, there's a warning sign here too. The residuals are clearly asymmetrical given the large divergence between the min and max. This indicates that the residuals are left skewed.  
+
+```{r moodys lm}
+bond_lm <- lm(log_AAA ~ log_BAA, data = moodys_aaa)
+
+summary(bond_lm)
+```
+
+This is further confirmed using the residual series plot. There is still a clear pattern in the residuals indicating the linear model doesn't adequately capture the relationship between the bond classes.
+
+```{r lm residual plot}
+data.frame(lm_residuals = bond_lm$residuals) %>%
+  mutate(index = row_number()) %>%
+  ggplot(aes(index, lm_residuals)) +
+  geom_line(size = 1.3, colour = "dodgerblue2") +
+  labs(title = "Residual plot for log AAA and BAA Moody's bond yields regression model",
+       subtitle = "Visualization highlights pattern is still evident in residuals as the series doesn't resemble white noise")
+```
+
+As a final check, I've included an ACF plot for the residuals. Even after 200 lags, serial auto-correlation is present. Overall, these residuals are clearly non-stationary as a result.
+
+```{r acf plot for lm}
+ggAcf(x = bond_lm$residuals, lag.max = 200) +
+    labs(title = "ACF for log AAA and BAA Moody's bond yields regression model residuals",
+       subtitle = "Visualization highlights long memory residuals that decay slowly")
+```
+
+One option to correct for this here is differencing both yields, which I've done below. The model now shows a much poorer fit, as seen with the lower $R^2$, but the slope coefficient is still highly significant. The residuals also look more symmetrical as well.
+
+```{r differenced log yields}
+moodys_differenced <- moodys_aaa %>%
+  select(log_AAA, log_BAA) %>%
+  mutate_all(function(x) c(0, diff(x))) %>%
+  slice(-1)
+
+diff_bond_lm <-lm(log_AAA ~ log_BAA - 1, data = moodys_differenced)
+
+summary(diff_bond_lm)
+```
+
+Despite this transformation, the model still shows residuals with serial auto-correlation. The residuals appear more like white noise but, the ACF and Ljung-Box test confirm there is still auto-correlation present.  The ACF plot further shows that there is one large auto-correlation spike at lag 1, which stands out as an MA option.
+
+```{r diff lm ACF}
+checkresiduals(diff_bond_lm, test = "LB", lag = 30)
+```
+
+Carrying this forward, I've constructed an MA 1 ARMA model with the differenced linear model residuals included. The model has a significant MA coefficient and the residuals look even more symmetrical than the previous iteration. 
+
+```{r arma modelling}
+moodys_ma1 <- armaFit(~arma(0, 1), data = diff_bond_lm$residuals)
+
+summary(moodys_ma1, which = 0)
+```
+
+The ACF and Ljung-Box p-value plot show that the series residuals is close to stationarity. A Ljung-Box test shows the series is right on the threshold of stationarity given a .035 p-value. While under a .05 alpha, the strength of evidence is close enough to think that it's probably alright to suggest the stationarity condition has been met.
+
+```{r ma1 residual check}
+checkresiduals(moodys_ma1@residuals$residuals)
+
+Box.test(x = moodys_ma1@residuals$residuals, lag = 30, fitdf = 2)
+```
+
+These residuals form the basis of the next linear regression model. This requires manually building the model with the derived MA 1 coefficients and residuals. As a starting point, I've created the residuals multiplied by the MA coefficient; this new vector is the stationary residual series being added to the regression model. The forecast model values are the log AAA yield values plus the differenced linear model coefficients multiplied by the log BAA values (predictor here) with the stationary residuals added in. As seen, this produces a very close forecast.
+
+```{r developing lm model coef}
+a_t <- moodys_ma1@fit$coef[1] * moodys_ma1@residuals$residuals
+
+x_1 <- moodys_aaa$log_AAA[-length(moodys_aaa$log_AAA)]
+
+forecast_results <- moodys_aaa %>%
+  slice(-1) %>%
+  mutate(forecast = x_1 + diff_bond_lm$coefficients * moodys_differenced$log_BAA + a_t 
+         %>% as.vector()) %>%
+  select(log_AAA, forecast, Date)
+  
+forecast_results %>%
+  gather(key = "series", value = "value", -Date) %>%
+  ggplot(aes(Date, value, colour = series)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "series") +
+  scale_colour_manual(values = colours) +
+  labs(title = "Forecast vs actual for linear model with stationary residuals",
+       subtitle = paste("Both series are very close; MAE =",
+                        Metrics::mae(
+                          forecast_results$log_AAA, forecast_results$forecast
+                          ) %>% round(5)
+                        )
+                      )
+```
+
+***
+
+###Cointegration Modelling
+
+Cointegration reviews if two time series move together but, vary along the way. The idea here is derived from a random walk where the two series are broadly going in the same direction, owing to some underlying structural connection, but aren't necessarily taking the same path. Using the Moody's example, the two classes are inherently part of the same bond market despite different ratings. With this, there's an expectation that they should broadly be connected. This general intuition, coupled with the initial regression results indicating the series are closely related, suggest that doing cointegration modelling makes sense here.
+
+Formally, two series are said to be cointegrated if each of the series taken individually is unit-root non-stationary, while there exists some linear combination of the series which is stationary for some non-zero vector.  This cointegration can be tested using the Johansen Test, which is conducted using the `ca.jo` function. The test operates by forming vectorized auto-regressive models (a combination of two time series with a matrix that stores coefficients) which are then differenced to derive a Vector Error Correction Model. The test checks for the situation of no cointegration, which occurs when the coefficients matrix is 0 (Quantstart, 2018). Assessing this is done using eigenvalue decomposition of this matrix. During this, the matrix rank is reviewed
+to sequentially test whether this rank is equal to zero or one. The null hypothesis is that the rank is zero, meaning there is no cointegration. Setting the test up, I've included both log series for AAA and BAA yields, specified the eigenvalue decomposition, selected two lag checks for the test, and specified long run to construct the Vector Error Correction Model reviewed above. 
+
+The initial summary provides some insight into the cointegration testing. The test values for $r = 0$, or no cointegration, shows the 10% and 5% levels as being significant. With this, the null hypothesis can be rejected. However, the second test, $r \leq 1$, shows a test statistic that is lower than all three confidence levels. In this case, the null cannot be rejected. Putting these both together, the cointegration order can be specified as 1, which means the rank of the coefficient matrix is one. Further, this means that a linear combination of both series should form a stationary series. 
+
+```{r fitting cointegration model}
+moodys_cointegrate <- moodys_aaa %>%
+  select(log_AAA, log_BAA)
+
+moodys_johansen <- ca.jo(x = moodys_cointegrate, 
+                         ecdet = "none", 
+                         type = "eigen", 
+                         K = 2, 
+                         spec = "longrun")
+
+summary(moodys_johansen)
+```
+
+The residuals show that the first series may have some auto-correlation but, overall it appears stationary. However, the second cannot be stationary given it is not a cointegration vector.
+
+```{r cointegration series residuals}
+plotres(moodys_johansen)
+```
+
+I've constructed the aforementioned linear combinations below. These are derived by multiplying the initial data with the eigenvectors. The first by definition must be stationary. 
+
+```{r linear combination from cointegration}
+coint_series <- data.frame(
+  zt1 = as.matrix(moodys_cointegrate) %*% moodys_johansen@V[,1],
+  zt2 = as.matrix(moodys_cointegrate) %*% moodys_johansen@V[,2]
+) %>%
+  mutate(index = row_number())
+
+coint_series %>%
+  gather(key = "series", value = "value", -index) %>%
+  ggplot(aes(index, value, colour = series)) +
+  geom_line(size = 1.3) +
+  scale_colour_manual(values = colours) +
+  labs(title = "Series from linear combinations using cointegration eigenvector coefficients",
+       subtitle = "Zt1 is stationary given the cointegration order = 1")
+```
+
+This is reaffirmed below, though the p-value is right against the 5% confidence alpha. The other vector is not stationary, which is indicated by the very high p-value.
+
+```{r adf tests for linear combinations}
+adf.test(x = coint_series$zt1)
+
+adf.test(x = coint_series$zt2)
+```
+
+With the model developed, it can now be used for predictions. One of the main focuses of this analysis is to review whether the linear model with stationary residuals or the cointegration provides more appropriate forecasts. To test this, forecasts for the AAA bonds need to be made here. This is a lengthy process that involves collecting all the cointegration coefficients and constructing the predictions from them. Following their collection, the predictions can be made. I've stored the results alongside the initial AAA log yield and residuals for each method in a data frame for review.
+
+```{r cointegration prediction}
+mu <- moodys_johansen@GAMMA[,1]
+
+PI <- moodys_johansen@PI
+
+Gamma <- moodys_johansen@GAMMA[,2:3]
+
+delta_series1 <- moodys_johansen@Z0
+
+delta_series2 <- moodys_johansen@ZK
+
+deltaX_t_1 <- Gamma %*% t(delta_series1) + PI %*% t(delta_series2) 
+
+deltaX_t_1 <- apply(deltaX_t_1, 2, "+", mu)
+
+nrowsdata <- dim(moodys_cointegrate)[1]
+
+data_t_2 <- moodys_cointegrate[3:nrowsdata,]
+
+deltaX_t_1 <- t(deltaX_t_1)
+
+forecast_results <- forecast_results %>%
+  slice(-1) %>%
+  bind_cols(data_t_2 + deltaX_t_1) %>%
+  select(Date,
+         log_AAA,
+         coint_pred = "log_AAA1",
+         lm_pred = forecast) %>%
+  mutate(coint_resid = log_AAA - coint_pred,
+         lm_resid = log_AAA - lm_pred)
+
+forecast_results %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+###Which model is more appropriate for predicting the AAA yield?
+
+The final section focuses on reviewing the prediction result for each method. Starting this, I've visualized each prediction alongside the initial AAA log yield values. The plot shows that both methods are very close but, there isn't any definitive signs as to which has better accuracy given their close similarities.
+
+```{r prediction comparison}
+forecast_results %>%
+  mutate(index = row_number()) %>%
+  select(index, lm_pred, coint_pred, log_AAA) %>%
+  gather(key = "series", value = "residuals", - index) %>%
+  ggplot(aes(index, residuals, colour = series)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "series") +
+  scale_colour_manual(values = colours) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Forecast plot for linear model with stationary residuals and cointegration for AAA Moody's log yields",
+       subtitle = "Both methods show congruency with log AAA yields")
+```
+
+The residual plot is more informative here. The linear residuals, coloured with orange, show a wider variance band. The model has the largest and smallest residual here but, also shows being slightly larger or smaller than the cointegration at most indices. Overall, it appears the cointegration model has residuals more closely clustered around zero, indicating a better forecast accuracy.
+
+```{r residual comparison}
+forecast_results %>%
+  mutate(index = row_number()) %>%
+  select(index, lm_resid, coint_resid) %>%
+  gather(key = "series", value = "residuals", - index) %>%
+  ggplot(aes(index, residuals, colour = series)) +
+  geom_line(size = 1.3, alpha = .4) +
+  scale_colour_manual(values = colours) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Residuals plot for linear model with stationary residuals and cointegration for AAA Moody's log yields",
+       subtitle = "Cointegration model appears to have narrower residual band")
+```
+
+Indeed, this is confirmed using Mean Absolute Error (MAE) and Mean Squared Error (MAE) where the cointegration model shows lower accuracy metrics indicating better predictions. With this in mind, the cointegration model is preferable for forecasting the log AAA Moody's bond yields over the time period presented here.
+
+```{r metric comparison}
+data.frame(
+  model = c("Cointegration", "LM"),
+  mae = c(
+    Metrics::mae(actual = forecast_results$log_AAA, 
+                 predicted = forecast_results$coint_pred
+    ) %>% round(4),
+    Metrics::mae(actual = forecast_results$log_AAA, 
+                 predicted = forecast_results$lm_pred
+    ) %>% round(4)
+  ),
+    mse = c(
+    Metrics::mse(actual = forecast_results$log_AAA, 
+                 predicted = forecast_results$coint_pred
+    ) %>% round(10),
+    Metrics::mse(actual = forecast_results$log_AAA, 
+                 predicted = forecast_results$lm_pred
+    ) %>% round(10)
+  )
+) %>% custom_kable()
+```
+
+***
+
+###References:
+
+####Quantstart: Johansen Test for Cointegrating Time Series Analysis in R
+
+####Access: https://www.quantstart.com/articles/Johansen-Test-for-Cointegrating-Time-Series-Analysis-in-R
+
+***

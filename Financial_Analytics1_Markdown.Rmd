@@ -1,0 +1,244 @@
+---
+title: 'Financial Analytics #1'
+author: "Mark Preston"
+date: "January 18, 2019"
+output:
+  html_document:
+    fig_height: 6.5
+    fig_width: 10.5
+  pdf_document: default
+  word_document: default
+---
+
+***
+
+##Download and analyze excess returns of S&P 500
+
+###Calculate continuous daily excess returns of SP500 (“^GSPC”) for the period from 1/1/2014 until 12/31/2014 using overnight Fed Funds rates as risk-free rates.
+
+To begin the analysis, I'm loading the necessary data and packages. The section calls for downloading excess returns for the SP500, which can be done using `getSymbols` from the quantmod package. The function accesses and API to get the necessary data from one of several finance sites. Alongside this, I've uploaded overnight Fed Fund values, which will be used as the risk-free rate during the calculations.
+
+The excess return calculation is a three step process here. First, I've calculated the net return for the SP500 using the formula: $\frac{P_t - P_t -_1}{P_t -_1}$. This essentially just means each day is differenced from the day before and divided by the present day's value. This calculation is done using the closing price of the SP 500 fund, though the adjusted rate would work as well. This provides the net return. Second, the risk free rate is quoted as a yearly value so it has to be adjusted to a daily level. This can be done by dividing each daily value by 360. With both these transformation complete, the net return can then be subtracted from the risk free rate to get the excess return for each day in the set. The first five rows from final data frame are shown below with these values.
+
+```{r loading packages and downloading data, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(quantmod)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+
+fed_rates <- read.csv("RIFSPFF.csv", stringsAsFactors = F) %>%
+  rename(date = Time.Period,
+         risk_free_rate = RIFSPFF_N.D) %>%
+  mutate(date = as.Date(date, format = "%m / %d / %Y"))
+
+getSymbols(Symbols = "^GSPC", from = "2014-1-1", to = "2014-12-31")
+
+sp_500 <- GSPC %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "date") %>%
+  mutate(SP500_return = c(0, diff(GSPC.Close) / GSPC.Close[seq(2, nrow(GSPC), 1)]),
+         SP500_return = round(SP500_return, 9), 
+         date = as.Date(date)) %>%
+  left_join(x = ., y = fed_rates, by = "date") %>%
+  mutate(risk_free_rate = risk_free_rate / 360,
+         excess_return = SP500_return - risk_free_rate) %>%
+  slice(-1) %>%
+  select(date, SP500_return, risk_free_rate, excess_return)
+
+sp_500 %>%
+  head() %>%
+  custom_kable()
+```
+
+With the excess returns calculated, I've visualized them alongside the risk free rate here. As seen, the fed risk-free rate is consistently stable while the SP 500 excess returns fluctuate across the series. I think they appear, on average, to be higher than the risk free rate.
+
+```{r analyzing sp500 returns}
+sp_500 %>%
+  select(date, risk_free_rate, excess_return) %>%
+  gather(key = "variable", value = "value", -date) %>%
+  ggplot(aes(date, value, colour = variable, group = variable)) +
+  geom_line(size = 1.3, alpha = .75) +
+  scale_x_date(breaks = "3 months") +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Time series plot for Risk Free Rate & SP 500 Excess Returns (Jan. 1, 2014- Dec. 31, 2014)",
+       subtitle = "SP Returns fluctuate around the Risk Free Rate but appear to be higher on average over the series")
+```
+
+Some summary statistics for the the excess returns can be seen below which confirms the daily excess return is on average higher than the risk free rate here. Given the positive mean, it appears that it would have been preferable to the risk free rate. An investor holding this fund would, on average, earn returns each day over the risk free rate. Overall, this means that holding an SP 500 index during this period would be a better investing decision than having held money in the risk free rate, which is an intuitive result for this era.
+
+```{r SP 500 summary stats}
+sp_500 %>%
+  summarise(excess_return_min = min(excess_return),
+            excess_return_mean = mean(excess_return),
+            excess_return_median = median(excess_return),
+            excess_return_max = max(excess_return)) %>%
+  custom_kable()
+```
+
+I've also included a density plot of the excess return distribution. It does not appear normal and with a kurtosis of 1.368, resembles Platykurtic distribution.
+
+```{r SP 500 excess return density}
+sp_500 %>%
+  ggplot(aes(excess_return)) +
+  geom_density(fill = "dodgerblue2", colour = "darkgray", alpha = .5) +
+  geom_vline(xintercept = mean(sp_500$excess_return), size = 1.3, 
+             colour = "darkorange", alpha = .5) +
+  labs(title = "Density plot for SP 500 Excess Returns (Jan. 1, 2014- Dec. 31, 2014)",
+       subtitle = paste0("Distribution appears to Platykurtic with kurtosis of ",
+                         round(psych::kurtosi(x = sp_500$excess_return), 3),
+                        "; Orange line is mean")
+  )
+```
+
+***
+
+##Download and analyze exchange rates for GBP/USD and USD/JPY
+
+###Calculate daily log returns for both exchange rates
+
+The `getSymbols` function can be used again here to extract the currency exchange rates for the Pound/USD and USD/Yen. Once the rates are downloaded, I've made a function that turns the values into a data frame and adds the data as a formal column. Using this, both sets can be joined for the analysis. Following this, the daily log returns are derived by differencing the log exchange rate for each column ($ln(P_t) - ln(P_t -_1)$). Having done this for both exchanges, I've dropped the first row given it doesn't have a log return value.
+
+```{r downloading currency exchange rates}
+getSymbols(Symbols = "GBP/USD", src = "oanda")
+
+getSymbols(Symbols = "USD/JPY", src = "oanda")
+
+symbol_clean <- function(data){
+  set <- data %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "date") %>%
+    mutate(date = as.Date(date))
+  
+  return(set)
+}
+
+exchange_rates <- inner_join(x = symbol_clean(data = GBPUSD), 
+                             y = symbol_clean(data = USDJPY), 
+                             by = "date") %>%
+  mutate(gbp_usd_lr = c(0, diff(log(GBP.USD))),
+         usd_yen_lr = c(0, diff(log(USD.JPY)))) %>%
+  rename_all(tolower) %>%
+  slice(-1)
+
+exchange_rates %>%
+  head() %>%
+  custom_kable()
+```
+
+The series includes the last 180 days of exchange rates. During this time, both exchange rates show a decline but, the USD to Yen rate has gone down by about 5 points since mid-December. This means that USD isn't trading for as many Yen as it did in August 2018.
+
+```{r time series for exchange rates}
+exchange_rates %>%
+  select(date, usd.jpy, gbp.usd) %>%
+  gather(key = "currency_exchange", value = "rate", -date) %>%
+  ggplot(aes(date, rate, colour = currency_exchange)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "currency_exchange", scales = "free") +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "GBP/USD & USD/JPY exchange rates for the last 180 days",
+       subtitle = "Both show rate declines over series- USD/JPY rate has seen large drop (~5 points) since mid-December")
+```
+
+During the same time, each exchange rate's log returns have varied. The USD to Yen shows the largest negative log return following the dropping exchange rates in late December. Overall, the GBP to USD series appears to have a higher average log return, though it does seem more variable (i.e. has a larger standard deviation). 
+
+```{r time series for exchange rate log returns}
+exchange_rates %>%
+  select(date, gbp_usd_lr, usd_yen_lr) %>%
+  gather(key = "currency_exchange", value = "log_return", -date) %>%
+  ggplot(aes(date, log_return, colour = currency_exchange)) +
+  geom_line(size = 1.3, show.legend = F) +
+  geom_hline(yintercept =  0, colour = "darkgray", size = 1.3, alpha = .6) +
+  facet_wrap(facets = "currency_exchange") +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "GBP/USD & USD/JPY exchange rate log returns for the last 180 days",
+       subtitle = "Both show fluctuating log returns- USD/JPY shows largest log return loss in January")
+```
+
+###Calculate sample min, mean, sd, skewness, kurtosis, max of log returns for both exchange rates
+
+A variety of summary statistics can be found for both exchanges below. These reinforce that GBP to USD rate has a slightly higher log return mean while also being more variable given the larger standard deviation. The GBP to USD exchange rate is also more skewed than the USD to Yen rate but, has a much lower kurtosis. The USD to Yen kurtosis value highlights a tall, skinny distribution which could be described as Mesokurtic. The GBP to USD kurtosis value indicates it might be Platykurtic.
+
+```{r summary stats for log returns}
+exchange_gathered <- exchange_rates %>%
+  select(gbp_usd_lr, usd_yen_lr) %>%
+  gather(key = "currency_exchange", value = "log_return")
+
+exchange_gathered %>%
+  group_by(currency_exchange) %>%
+  summarise(log_return_min = min(log_return),
+            log_return_mean = mean(log_return),
+            log_return_sd = sd(log_return),
+            log_return_skew = psych::skew(log_return),
+            log_return_kurt = psych::kurtosi(log_return)) %>%
+  custom_kable()
+```
+
+Density plots of each log return distribution further highlights that neither distribution is Gaussian, though the GBP to USD appears closer. Additionally, it appears that neither mean is significantly different from zero, though this will be formally tested.
+
+```{r histograms for log returns}
+exchange_gathered %>%
+  ggplot(aes(log_return, fill = currency_exchange)) +
+  geom_density(alpha = .5, colour = "darkgray", show.legend = F) +
+  geom_vline(xintercept = 0, size = 1.3, colour = "darkgray", alpha = .75) +
+  facet_wrap(facets = "currency_exchange") +
+  scale_fill_manual(values = c("dodgerblue2", "darkorange")) +
+  scale_x_continuous(breaks = seq(-.01, .1, .01)) +
+  labs(title = "Density plots for GBP/USD & USD/JPY log returns",
+       subtitle = "Both show non-Gaussian distributions with USD/JPY appearing Mesokurtic")
+```
+
+###Test hypothesis that exchange rate log returns differ from zero
+
+Formalizing the previous intuition on the log return means, I've developed t-tests for both exchange rates here. This hypothesis testing values whether each log return differs from zero:
+
+**Null Hypothesis**: $H_0: \mu = 0$
+
+**Alternative Hypothesis**: $H_1: \mu \neq 0$
+
+I've developed a t-test function to conduct the hypothesis testing manually. The function derives the t-value, uses it to find the test's p-value, and then evaluates whether the test is significant. The results for both show that in both cases, the strength of evidence is not enough to reject the null hypothesis in favour of the alternative. As such, the null is not rejected which means the log return means do not appear to differ from zero.
+
+```{r log return t testing}
+manual_t_test <- function(name, var, n){
+  t_test <- data.frame(
+    exchange = name,
+    t_value =  (mean(var)) / (sd(var) / sqrt(n))
+  ) %>%
+  mutate(p_value = 2 * pt(abs(t_value), n - 1, lower = FALSE),
+         significance = ifelse(p_value < .05, "significant", "not significant"),
+         hypothesis = ifelse(p_value < .05, "null rejected", "null not rejected")) %>%
+    mutate_at(vars(2, 3), function(x) round(x, 4))
+
+  return(t_test)
+}
+
+rbind(
+  manual_t_test(name = "gbp_usd", var = exchange_rates$gbp_usd_lr, 
+                n = nrow(exchange_rates)),
+  manual_t_test(name = "usd_yen", var = exchange_rates$usd_yen_lr, 
+                n = nrow(exchange_rates))
+  
+) %>% custom_kable()
+```
+
+To verify the manual approach, I've included the `t.test` function results here. These are congruent with the manual approach.
+
+```{r function t test}
+t.test(x = exchange_rates$gbp_usd_lr)
+
+t.test(x = exchange_rates$usd_yen_lr)
+```
+
+***

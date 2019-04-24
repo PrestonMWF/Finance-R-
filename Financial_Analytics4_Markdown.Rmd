@@ -1,0 +1,332 @@
+---
+title: "Linear Time Series Models for Financial Data II"
+author: "Mark Preston"
+date: "February 1, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##ARIMA modelling with Johnson & Johnson Quarterly Earnings per Share
+
+This week, I'll be using various time series models to review the Johnson & Johnson company earnings. The analysis will include fitting models with earnings segmented into 1992 to 2011 and 1992 to 2008. With these, I'll provide quarterly return forecasts for 10 steps ahead. The initial five rows of the data is shown below. I've unified the date column in addition to including another column for log earnings.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(TSA)
+library(tseries)
+library(lmtest)
+library(plotrix)
+library(gridExtra)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+colours <- c("dodgerblue2", "darkorange", "darkorchid3", "forestgreen")
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+JJ_earnings <- read.table("JandJ_earnings.txt", sep = "", header = T) %>%
+  unite(c("year", "mon", "day"), col = "date", sep = "/", remove = T) %>%
+  mutate(date = as.Date(date),
+         log_earnings = log(earns)) %>%
+  rename(earnings = earns)
+
+JJ_earnings %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+###Modelling Johnson & Johnson Share Earnings
+
+To start, I've included some basic summary statistics to get familiar with the earnings per share. It appears  the earnings per share, which are reported on a quarterly basis, are positive on average. In fact, the Johnson and Johnson numbers never show a negative quarter given the minimum is above zero. At the high end, the earnings per share go up to 1.35. Overall, these seem to highlight a healthy, positive earnings review. 
+
+```{r jj earning summary}
+earnings_summary_stats <- JJ_earnings %>%
+  select(-1) %>%
+  gather(key = "return_type", value = "return_value") %>%
+  group_by(return_type) %>%
+  summarise(return_min = min(return_value),
+            return_median = median(return_value),
+            return_mean = mean(return_value),
+            return_max = max(return_value))
+
+earnings_summary_stats  %>%
+  custom_kable()
+```
+
+The density plot for each variable show clear signs that returns have fluctuated from low to high. There are an evenly spaced range of progressively larger values in each visualization. Putting this together with the summary statistics, I think this means that the earnings per share have been steadily increasing over time.
+
+```{r jj earnings density plot}
+JJ_earnings %>%
+  select(-date) %>%
+  gather(key = "return_type", value = "value") %>%
+  ggplot(aes(value, colour = return_type, fill = return_type)) +
+  geom_density(size = 1.3, show.legend = F, alpha = .5) +
+  geom_vline(data = earnings_summary_stats, 
+             aes(xintercept = return_median),
+             alpha = .8, size = 1.3 ,colour = "darkgray") +
+  facet_wrap(facets = "return_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  scale_fill_manual(values = colours)  +
+  labs(title = "Density plots for Johnson & Johnson quarterly earnings returns from 1992 to 2011",
+       subtitle = "Values are for both simple and log earnings per share")
+```
+
+The time series plot for both variables confirms this intuition. Since 1992, the earnings per share have steadily increased. In the non-log earnings, the growth appears almost exponential as well. Providing the log earnings helps make the series more linear, which makes it ideal for the modelling portion. That said, there is a slope change around 2008 where the log earnings per share change trajectory. This is the same effect I described in the untransformed earnings but, it manifests slightly different here. This change may affect any forecasting results since it deviates from previous 16 years of earnings per share reporting.
+
+The other interesting insight here is that there are signs of seasonality. The seasonal component seems to indicate that the earnings vary depending on what quarter it is. As an additional insight, the seasonality seems to change around 2007 where the series pattern changes. This may be a product of the Great Recession but, the seasonality appears to be sharper between high and low earnings per share. 
+
+```{r earnings time series plot}
+JJ_earnings %>%
+  gather(key = "earnings_type", value = "value", -date) %>%
+  ggplot(aes(date, value, colour = earnings_type)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "earnings_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  labs(title = "Time series for Johnson & Johnson quarterly earnings per share from 1992 to 2011",
+       subtitle = "Earnings have positive trend while also displaying seasonality- log makes series more linear")
+```
+
+I wanted to investigate this line of inquiry more so I've created a plot below with each quarterly earnings series split. This means that every year shows four observations, one per quarter, which can be tracked across the series. In 1992, the difference between all four quarterly values is close. Q1 is really the only value that is smaller while the other three are almost identical. However, this spread diverges across the series. By the mid-2000s, there is a noticeable break where Q1 and Q4 become even more separated while Q2 and Q3 remain nearly congruent. This essentially means the Johnson and Johnson start the year with the lowest earnings per share, have two quarters with near equal values, and then finish the year strong. Given this, adding seasonality to any ARIMA modelling seems like a reasonable choice.
+
+```{r earnings time series plot by quarter}
+JJ_earnings %>%
+  mutate(quarter = c(rep(1:4, 19), 1:2) %>% as.factor()) %>%
+  gather(key = "earnings_type", value = "value", -date, -quarter)  %>%
+  ggplot(aes(date, value, colour = quarter)) +
+  geom_line(size = 1.3, alpha = .65) +
+  facet_wrap(facets = "earnings_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Time series for Johnson & Johnson quarterly earnings earnings per share with quarters separated",
+       subtitle = "Seasonality can be seen: Q1 shows lowest earnings leading into high Q2 before receeding slightly into Q3 and Q4")
+```
+
+####Build a time series model for the returns from 1992-2011
+
+While the series shows clear signs of being non-stationary, I've included an Augmented Dickey-Fuller test below to verify this. The test reviews the null hypothesis that there is a unit root, which is done over multiple series lags. I've opted to use 10 lags to provide a large range for the hypothesis testing. The high p-value signals that the null hypothesis cannot be rejected indicating that the series is non-stationary.
+
+```{r adf test for jj earnings}
+adf.test(x = JJ_earnings$earnings, k = 10)
+```
+
+Non-stationarity signals that a differencing term needs to be included in the most appropriate time series model. One method for determining the differencing term is by developing the coefficients of the characteristic polynomial and then finding the respective roots. From there, the root modulas can be found; any of these values less than one indicates that it is inside the unit circle. The number of points inside the unit circle generally corresponds to how large the differencing order should be. That said, the rule of thumb for differencing is d = 1, so going much past that is not advisable.
+
+This work below yields a unit circle with two points clearly inside. As such, the differencing could be as high as 2. Since the initial plotting show seasonality in the series, this might indicate that both seasonal and regular differencing might be appropriate. Outside of the ordering, this reaffirms the need to difference and provides some guidance on conducting the operation. As a methodological note, I've used `draw.circle` to derive the x and y coordinates for the unit circle here and saved the values to the object `unit_root_circle` so they can be used with ggplot2. This includes creating the visualization in base plot, which I've omitted here using `include = F` as part of the R markdown rendering.
+
+```{r eveloping polynomials}
+jj_polynomials <- c(1, ar(x = JJ_earnings$log_earnings)$ar)
+
+jj_polynomials <- polyroot(jj_polynomials)
+
+jj_polynomials <- data.frame(
+  real = Re(jj_polynomials),
+  imaginary = Im(jj_polynomials),
+  mod = Mod(jj_polynomials)
+) %>%
+  mutate(unit_circle = ifelse(mod < 1, "inside", "outside"),
+         unit_circle = factor(unit_circle, levels = c("outside", "inside")))
+```
+
+
+```{r include=FALSE}
+plot(jj_polynomials$real,jj_polynomials$imaginary,
+     asp=1,xlim=c(min(jj_polynomials$real),max(jj_polynomials$real)),
+     ylim=c(min(jj_polynomials$imaginary),max(jj_polynomials$imaginary)))
+unit_root_circle <- draw.circle(0, 0, radius = 1)
+```
+
+
+```{r checking unit root circle}
+data.frame(
+  x = unit_root_circle$x, 
+  y = unit_root_circle$y
+)  %>%
+  ggplot(aes(x, y)) +
+  geom_point(size = 5.5, alpha = .2, colour = "darkgray") +
+  geom_point(aes(x = real, y = imaginary, colour = unit_circle), 
+             size = 4, data = jj_polynomials) +
+  geom_vline(xintercept = 0, size = 1.3, colour = "darkgray") +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkgray") +
+  scale_colour_manual(values = colours) +
+  labs(title = "Unit root analysis for Johnson & Johnson log earnings per share",
+       subtitle = "Two roots are inside unit circle- Difference term could be up to 2 (d = 2)")
+```
+
+The next thing I want to review here is the auto-correlation plots for log earnings per share. I've included four different ACF options here, each of which provides insight on how the time series model might be constructed. The unaltered log earnings per share show long memory serial correlation. Both the differenced and seasonally differenced series also show substantial auto-correlation. The only ACF plot that shows no serial auto-correlation is where both seasonal and routine differencing is present. While there does appear to be significant spike at lag 13, I think this can be discounted as random noise given how far into the series it is. I think this differencing choice is further reinforced given there were two roots inside the unit circle as well.
+
+```{r autocorrelation plotting}
+log_acf <- ggAcf(x = JJ_earnings$log_earnings) +
+  ggtitle("Log earnings per share ACF")
+
+diff_log_acf <- ggAcf(x = diff(JJ_earnings$log_earnings)) +
+  ggtitle("Differenced log earnings per share ACF")
+
+seasonal_log_acf <- ggAcf(x = diff(JJ_earnings$log_earnings, lag = 4)) +
+  ggtitle("Seasonal differenced log earnings per share ACF")
+
+two_diff_log_acf <- ggAcf(x = diff(diff(JJ_earnings$log_earnings, lag = 4))) +
+  ggtitle("Seasonal and regular differenced log eps ACF")
+
+grid.arrange(log_acf, diff_log_acf, seasonal_log_acf, two_diff_log_acf, 
+             top = "Johnson & Johnson earnings per share ACF plots- two difference terms reduces serial autocorrelation")
+```
+
+The previous sections suggested developing a seasonal ARIMA model with two differencing terms. A rule of thumb with models with this differencing specification, it's recommended that an "airline model" be tried. This is simply the name for an seasonal ARIMA model specified as (0, 1, 1)(0, 1, 1). Given this, I've developed the appropriate model below. MA 1 shows what appears to be a significant coefficient but, the seasonal value appears to be less certain.
+
+
+Formally, the model can be written as:
+
+(1 - $B$)(1 - $B^4$)$x_t$ = (1 - .3419$B$)(1 - .1849$B^4$) = $\epsilon_t$, $\sigma{^2_\epsilon}$ = 0.001035
+
+```{r developing airline sarima model}
+jj_ts <- JJ_earnings %>%
+  select(log_earnings) %>%
+  ts(frequency = 4)
+
+jj_ts_train <- window(jj_ts, end = 17.9)
+
+jj_ts_test <- window(jj_ts, start = 18)
+
+(jj_sarima_2011 <- Arima(y = jj_ts_train, 
+                         order = c(0, 1, 1),
+                         seasonal = list(order = c(0, 1, 1), period = 4)))
+```
+
+The coefficient significance testing confirms that the first MA term is significant while the seasonal one is not.
+
+```{r sarima coef test}
+coeftest(jj_sarima_2011)
+```
+
+The model residuals are promising and highlight that there is stationarity here. The ACF doesn't show any lags near significance while the Ljung-Box test has a p-value well above a .05 alpha.
+
+```{r sarima residuals check}
+checkresiduals(jj_sarima_2011, lag = 18)
+```
+
+As a final portion here, I've included a ten step forecast for the log earnings per share. The values here have been visualized below alongside the actual values. It's clear that the seasonality and general trend have been captured by the model but, the forecast remain high as a result. I mentioned this during the exploratory phase but, the earnings per share series changed changed around 2008, possibly as a result from the Great Recession. Given this, the model essentially keeps the same trend and seasonality from the previous 16 years, which does not account for the more recent change. As such, accuracy suffers.
+
+```{r forecasting result for seasonal arima}
+jj_forecast_2011 <- forecast(jj_sarima_2011, h = 10)
+
+jj_sarima_mae <- Metrics::mae(
+  actual = jj_ts_test, 
+  predicted = jj_forecast_2011$mean 
+) %>% round(4)
+
+autoplot(jj_ts) +
+  autolayer(jj_forecast_2011, series = "JJ_sarima", 
+            PI = FALSE, size = 1.3) +
+  geom_line(colour = "darkgray", size = 1.3) +
+  labs(title = "Forecast for Johnson & Johnson log earnings per share with SARIMA (0, 1, 1)(0, 1, 1)",
+       subtitle = paste("Model appears to capture general trend and seasonality but, values are too high; MAE =", jj_sarima_mae),
+       y = "Traffic Volume") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+####Build a time series model for the returns from 1992-2008
+
+The model being built here reduces the series with any record past 2008 having been removed. As with before, I've opted to use the airline model to start. Formally, the model can be written as:
+
+(1 - $B$)(1 - $B^4$)$x_t$ = (1 - .2220$B$)(1 - .0368$B^4$) = $\epsilon_t$, $\sigma{^2_\epsilon}$ = 0.0009821
+
+```{r developing airline sarima model 2}
+jj_ts <- JJ_earnings %>%
+  filter(date <= "2008-10-14") %>%
+  select(log_earnings) %>%
+  ts(frequency = 4)
+
+jj_ts_train <- window(jj_ts, end = 15.4)
+
+jj_ts_test <- window(jj_ts, start = 15.5)
+
+(jj_sarima_2008 <- Arima(y = jj_ts_train, 
+                         order = c(0, 1, 1),
+                         seasonal = list(order = c(0, 1, 1), period = 4)))
+```
+
+Unfortunately, neither of the coefficients are significant. This leads me to believe that the model could be specified with better order.
+
+```{r sarima coef test 2}
+coeftest(jj_sarima_2008)
+```
+
+Prior to that though, I've included a residual check, which provides assurances that the residuals are stationary.
+
+```{r sarima residuals check 2}
+checkresiduals(jj_sarima_2008, lag = 18)
+```
+
+Outside of the airplane specifications, I don't have a great intuition on what model order I should use. With this in mind, I've developed the model using the `auto.arima` function, which tries to fit an optimal ARIMA, governed by AIC, using a search over possible order combinations. It picks up that there is seasonality while also changing the model order to (1, 0, 0)(0, 1, 0). This model has a much lower AIC than the airplane specification. It also remains relatively simple given there is only one AR term and one differencing term in the seasonal component alongside drift.
+
+```{r auto sarima}
+(jj_sarima_auto <- auto.arima(y = jj_ts_train, 
+                              approximation = F, 
+                              stepwise = F))
+```
+
+Similarly, the coefficients are also significant, which seems to be an improvement from the more manual approach.
+
+```{r auto coef test}
+coeftest(jj_sarima_auto)
+```
+
+As a final model check, I've included the residual review below. The ACF and p-value above .05 for the Ljung-Box confirm stationarity.
+
+```{r residual check for auto model}
+checkresiduals(jj_sarima_auto, lag = 18)
+```
+
+I've included both forecasts in the visualization below. The auto model shows a much closer fit that is almost perfectly congruent with the actual log earnings per share over the forecast horizon. Interestingly, this airplane model produces forecasts that underestimate the log earnings per share. In the previous iteration, the forecasts were higher instead. In any case, the non-Airplane specification seems to provide better forecast accuracy here.
+
+```{r forecasting result for seasonal arima 2}
+jj_forecast_2008 <- forecast(jj_sarima_2008, h = 10)
+
+jj_forecast_auto <- forecast(jj_sarima_auto, h = 10)
+
+autoplot(jj_ts) +
+  autolayer(jj_forecast_2008, series = "Airplane", 
+            PI = FALSE, size = 1.3) +
+  autolayer(jj_forecast_auto, series = "Auto", 
+            PI = FALSE, size = 1.3) +
+  geom_line(colour = "darkgray", size = 1.3) +
+  labs(title = "Forecast for Johnson & Johnson log earnings per share with two SARIMA models",
+       subtitle = "Auto arima model seems to produce more accurate forecast",
+       y = "Traffic Volume") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+To confirm this, I've included the mean absolute error for each method below. This confirms that the (1, 0, 0)(0, 1, 0) with drift was the better time series model here to forecast the 10-step horizon for Johnson & Johnson's log earnings per share using the 1992 to 2008 financial data.
+
+```{r method accuracy review}
+data.frame(
+  model = c("Airplane", "Auto"),
+  order = c("(0, 1, 1)(0, 1, 1)", "(1, 0, 0)(0, 1, 0)"),
+  mae = c(
+    Metrics::mae(actual = jj_ts_test, 
+                 predicted = jj_forecast_2008$mean
+    ),
+    Metrics::mae(actual = jj_ts_test, 
+                 predicted = jj_forecast_auto$mean
+    )
+  )
+) %>% custom_kable()
+```
+
+***

@@ -1,0 +1,359 @@
+---
+title: "Linear Time Series Models for Financial Data"
+author: "Mark Preston"
+date: "February 1, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##ARMA Modelling with CRSP Portfolio and Moody's AAA Bonds
+
+This week, I'll be using linear time series models to evaluate portfolio and bond returns. Additionally, I'll also forecast returns for the second decile of the CRSP portfolio. As a starting point, I've loaded both data sets. For both, I've added columns for log returns.
+
+```{r loading packages and data, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(TSA)
+library(tseries)
+library(fracdiff)
+library(lmtest)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+colours <- c("dodgerblue2", "darkorange", "darkorchid3", "forestgreen")
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+crsp_returns <- read.table("m-dec125910-6111.txt", sep = "", header = T)
+
+crsp_dec2 <- crsp_returns %>%
+  select(dec2) %>%
+  mutate(log_return = log(dec2 + 1),
+         record = row_number()) %>%
+  select(record, dec2, log_return)
+
+bond_yields <- read.table("m-aaa.txt", sep = "", header = T) %>%
+  unite(c("year", "mon", "day"), col = "date", sep = "/", remove = T) %>%
+  mutate(date = as.Date(date),
+         log_yield = log(yield)) %>%
+  slice(-1)
+```
+
+***
+
+###Modelling Second Decile from CRSP portfolios
+
+I've started here by constructing a summary statistics table for both log and normal returns. Both show that the second decile of monthly CRSP returns are, on average, positive.
+
+```{r exploratory work for crsp}
+yield_summary <- function(data){
+data %>%
+  select(-1) %>%
+  gather(key = "return_type", value = "return_value") %>%
+  group_by(return_type) %>%
+  summarise(return_min = min(return_value),
+            return_median = median(return_value),
+            return_mean = mean(return_value),
+            return_max = max(return_value))
+}
+
+yield_summary(data = crsp_dec2) %>%
+  custom_kable()
+```
+
+This is further confirmed when reviewing the density plot for each return column. Overall, it appears this portfolio was a good holding since it generally showed positive returns. While these do not account for any risk adjustments, the CRSP monthly returns here look promising. Since the portfolio is based on the market capitalization of NYSE/AMEX/NASDAQ, this result seems intuitive.
+
+```{r crsp decile 2 returns density plot}
+crsp_dec2 %>%
+  select(-record) %>%
+  gather(key = "yield_type", value = "yield") %>%
+  ggplot(aes(yield, colour = yield_type, fill = yield_type)) +
+  geom_density(size = 1.3, show.legend = F, alpha = .5) +
+  geom_vline(xintercept = 0, size = 1.3, colour = "darkgray", alpha = .8) +
+  facet_wrap(facets = "yield_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  scale_fill_manual(values = colours) +
+  labs(title = "Density plots CRSP 2nd decile portfolio returns from 1961 to 2011",
+       subtitle = "Values are for both simple and log monthly returns")
+```
+
+The time series plot for both columns show the variability of each return. The biggest negative spikes occur in the 1987 and 2008 stock market crashes while the positive spikes take place in 1975, possibly post-Breton Woods dissolution, and 2009 post-recession.
+
+```{r crsp decile 2 time series plot}
+crsp_dec2 %>%
+  gather(key = "yield_type", value = "yield", -record) %>%
+  ggplot(aes(record, yield, colour = yield_type)) +
+  geom_line(size = 1.3, show.legend = F) +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkgray", alpha = .8) +
+  facet_wrap(facets = "yield_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  labs(title = "CRSP 2nd decile portfolio returns from 1961 to 2011",
+       subtitle = "Values are for both simple and log monthly returns")
+```
+
+####Test null hypothesis that the first 12 lags of autocorrelations equal zero with 5% level
+
+In this section, I've set up a hypothesis test to review auto-correlation in the first 12 lags. The starting point here is reviewing the Auto-correlation Function (ACF) plot for the log returns. As seen, there is only one positive spike past the confidence intervals (blue dotted lines) occurring at lag 2. This seems to indicate that the log returns do not have any serial auto-correlation in the first 12 lags. It also sets up that the AR term in any ARMA modelling might be $p = 2$. As a methodological note, the `ggAcf` function does not include the auto-correlation at lag 1, which would be one. This permits a clearer interpretation because the high bar doesn't distort the plot.
+
+```{r crsp decile acf}
+ggAcf(x = crsp_dec2$log_return) +
+  labs(title = "Autocorrelation Function (ACF) plot for CRSP portfolio second decile log returns",
+       subtitle = "Series does not appear to show any major autocorrelation past lag 2; AR 2 model may be appropriate")
+```
+
+To formally test the intuition from the ACF plot, which appeared to show no signs of auto-correlation, I've used the Ljung-Box test. The portmanteau test checks for auto-correlation across a specified period of lags in the series. The null hypothesis of the test is that there is no serial auto-correlation in the first 12 lags while the alternative states that auto-correlation is not equal to zero.
+
+I've included two Ljung-Box tests here with $lag = 12$ and $lag = 24$. The first test shows a .08 p-value, which is above the stated alpha ($\alpha = .05$) so the null hypothesis cannot be rejected. However, the strength of evidence is close given the p-value is not much above .05. This isn't too surprising because there is a very large auto-correlation spike at $lag = 2$. When the lag is increased, the p-value increases as well since the large auto-correlation spike is further ameliorated and none of the lags past it show any real signs of being significant.
+
+The conclusion here is that there is no serial auto-correlation in the log returns for the CRSP portfolio's second decile. This indicates that the month-to-month returns do not have any significant auto-correlation to one another. Of note, it also appears there might be some light seasonality in the returns since the auto-correlation bars switch from positive to negative with some pattern.
+
+```{r crsp log returns box test}
+Box.test(x = crsp_dec2$log_return, lag = 12 , type = "Ljung")
+
+Box.test(x = crsp_dec2$log_return, lag = 24 , type = "Ljung")
+```
+
+Using the normal monthly returns, the tests still cannot reject the null hypothesis which bolsters that there is no serial auto-correlation in the series.
+
+```{r crsp returns box test}
+Box.test(x = crsp_dec2$dec2, lag = 12 , type = "Ljung")
+
+Box.test(x = crsp_dec2$dec2, lag = 24 , type = "Ljung")
+```
+
+####Fit ARMA model to CRSP decile 2 returns
+
+Having an AR term of 2 seems like a reasonable starting point after seeing the ACF plot. I've also included the PACF plot to pick an MA term. As a starting point, a smaller term of q = 1 seems reasonable given there is a spike at lag one, and then none thereafter. There might be a small negative spike past the significance level around lag 21 but, this is too high an order and might also be random noise.
+
+```{r pacf plot for crsp second decile}
+ggPacf(x = crsp_dec2$log_return) +
+  labs(title = "Partial Autocorrelation Function (PACF) plot for Moody's AAA bonds",
+       subtitle = "Lag 1 shows significant autocorrelation with zero afterwards; MA 1 (q = 1) may be approprirate")
+```
+
+To further check the AR term, I've used the `ar` function below. The table print out shows that p = 2 has the lowest AIC. Given this model will be used for predictions, I've also removed the last 12 records so they can be compared to the forecast. 
+
+```{r checking AR order}
+crsp_ar_orders <- ar(crsp_dec2$log_return[seq(1, nrow(crsp_dec2) - 12, 1)] , 
+                     method = "mle")
+
+data.frame(AIC = crsp_ar_orders$aic) %>%
+  rownames_to_column(var = "Order") %>%
+  arrange(AIC) %>%
+  custom_kable()
+```
+
+With this in mind, the first model I've developed an an ARIMA(2, 0, 1). What sticks out here is the model coefficients don't look significant. Both the AR and MA coefficients have estimates with very large standard errors. Of these, only the intercept appears significant.
+
+```{r specifying arma model for crsp}
+(crsp_dec2_arma <- Arima(y = crsp_dec2$log_return[seq(1, nrow(crsp_dec2) - 12, 1)], 
+                         order = c(2, 0, 1)))
+```
+
+Using the function `coeftest`, which puts together z-scores and significance tests from the coefficient standard errors and estimates, it is clear that none of the AR or MA terms are significant.
+
+```{r arma model coefficient review}
+coeftest(x = crsp_dec2_arma)
+```
+
+To enhance the model, I've put together an extended acf (ESACF). Each row represents and AR order while the columns are MA. O denotes an ACF value below the threshold of $\frac{2}{\sqrt T}$ where T is the time series length (597 here). The other symbol X highlights values above this threshold. Together, they point a reasonable ARMA composition. As a heuristic, the upper most O without an X is the spot to look for. In this instance, this order appears to be ARMA(0, 1).
+
+```{r checking for better ARMA order}
+eacf(z = crsp_dec2$log_return[seq(1, nrow(crsp_dec2) - 12, 1)])
+```
+
+The new model shows a lower AIC (-1938.58 vs -1936.82) and what appears to be a significant MA coefficient.
+
+```{r developing eacf arma}
+(crsp_eacf_arma <- Arima(y = crsp_dec2$log_return[seq(1, nrow(crsp_dec2) - 12, 1)], 
+                         order = c(0, 0, 1)))
+```
+
+The coefficient testing confirms that both terms are now significant. While this seems contrary to the ACF and `ar` work, the improved model fit metric and significant coefficients suggests this is a more suitable model. As such, I'll be carrying it forward for predictions.
+
+As specified, the model equation is:
+
+Backward shift operator: $Bx_t = x_{t - 1}$
+
+Model: (1 - .1378$B$)($ξt$ − 0.083) = $\alpha_t$, $\sigma^2_\alpha$ = 0.002261
+
+```{r eacf arma model coefficient review}
+coeftest(x = crsp_eacf_arma)
+```
+
+Reviewing the model residuals, the series appears to resemble white noise. Moreover, the ACF plot shows no significant auto-correlation spikes. Putting this together with the Ljung-Box test that shows a high p-value, the residuals do not appear to have any serial auto-correlation. 
+ 
+```{r checking arma residuals}
+checkresiduals(crsp_eacf_arma, lag = 28)
+```
+
+####Use the fitted model to produce 1 to 12 step ahead forecasts for the series. Include the associated standard errors for forecasts.
+
+Not surprisingly, the forecast accuracy is poor. The log returns are noisy to begin with making the task quite difficult but, an MA 1 model also converges to the set mean quickly. This model properties are on display here. For example, the predictions quickly revert to around the mean, save for some added noise. In fact, only the $h = 1$ shows a unique value while the other estimates are essentially just the log return mean. Again, an MA 1 model has this property whereby following the first forecast horizon, the model reverts to the broad mean plus noise. This same property can be seen in the prediction standard error as well where every value is almost congruent with the series standard deviation. While the model is useful for exploring time series modelling, it doesn't appear to have any wider predictive utility.
+
+```{r accuracy review}
+data.frame(
+  horizon = seq(1, 12, 1),
+  actual = tail(crsp_dec2$log_return, 12),
+  prediction = predict(crsp_eacf_arma, 12)$pred,
+  return_mean = mean(crsp_dec2$log_return),
+  pred_se = predict(crsp_eacf_arma, 12)$se,
+  return_sd = sd(crsp_dec2$log_return)
+) %>% custom_kable()
+```
+
+***
+
+###Modelling Monthly Yields of Moody’s AAA bonds
+
+Moving into the next section, I'll be working with the Moody's AAA bonds data. AAA bonds denote the highest credit rating Moody's gives so these returns are from stable, trustworthy companies. Additionally, the US Treasury returns would be included here as well. Below, the summary statistics for the class show variable returns. The log return mean is well above zero indicating each month, on average, provides a positive return. The series does appear variable though given the max and min returns are quite spread. Overall though, the returns here for the AAA bonds appear good.
+
+```{r return summary stats}
+yield_summary_stats <- yield_summary(data = bond_yields)
+
+yield_summary_stats %>%
+  custom_kable()
+```
+
+Density plots for each return set further reaffirm this. The log yield shows what could be three distinct time periods given it has multi-modal shape. Here, there appears to be a lower, medium, and high yield time periods.
+
+```{r bond yield density plot}
+bond_yields %>%
+  select(-date) %>%
+  gather(key = "return_type", value = "value") %>%
+  ggplot(aes(value, colour = return_type, fill = return_type)) +
+  geom_density(size = 1.3, show.legend = F, alpha = .5) +
+  geom_vline(data = yield_summary_stats, 
+             aes(xintercept = return_median),
+             alpha = .8, size = 1.3 ,colour = "darkgray") +
+  facet_wrap(facets = "return_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  scale_fill_manual(values = colours) +
+  labs(title = "Density plots Moody AAA bonds returns from 1919 to 2011",
+       subtitle = "Values are for both simple and log monthly returns- gray line denotes median return")
+```
+
+The series for each variable shows declining yields from 1920 into WWII but, a steady increase in the post ward era into a high point in the 1980s. Beyond this, yields for these AAA bonds have decreased to levels below initial values in the 1920s. Given these observations, the series appears to be non-stationary given the log yield is dependent on time. Here, the mean and variance is not uniform across the series, which makes the yield forecast time dependent. Additionally, the log yield series shows clear signs of auto-correlation. 
+
+```{r exploratory work for Moodys}
+bond_yields %>%
+  gather(key = "yield_type", value = "value", -date) %>%
+  ggplot(aes(date, value, colour = yield_type)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "yield_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  labs(title = "Time series for AAA Moody's bond yields and log yields from 1920-2011",
+       subtitle = "Yields have decreased steadily since a peak in the 1980s")
+```
+
+####Fit an appropriate time series model using log yield
+
+With the initial exploratory work done, I've switched to look at the time series properties of the log yields. The initial step is checking stationarity using an Augmented Dickey–Fuller Test. With a very high p-value, the null hypothesis, which is that the data is non-stationary, cannot be rejected. As such, the serial auto-correlation in the set is confirmed. This means that a full ARIMA (p, d, q) model is likely necessary. 
+
+```{r adf test for log yield}
+adf.test(x = bond_yields$log_yield)
+```
+
+Following this up, I've developed an ACF here. It shows both serial auto-correlation and long-memory residuals as well. This suggests that any modelling work will need a fractional differencing term.
+
+```{r acf for bond yield}
+ggAcf(x = bond_yields$log_yield) +
+  labs(title = "Autocorrelation Function (ACF) plot for Moody's AAA bonds log yield",
+       subtitle = "Log yield ACF shows serial autocorrelation and long-memory residuals as well")
+```
+
+To get a better sense of the auto-correlation without the long memory, I've differenced the log yields. This approach shows one significant spike at lag 1 but, no other lags. This suggests using a p = 1 model might make sense for the AR component.
+
+```{r acf for differenced bond yield}
+ggAcf(x = diff(bond_yields$log_yield)) +
+  labs(title = "Autocorrelation Function (ACF) plot for Moody's AAA bonds differenced log yield",
+       subtitle = "Lag 1 shows significant autocorrelation but not other lag; AR 1 (p = 1) may be approprirate")
+```
+
+I've also included a PACF plot to better understand the possible MA term. It's clear that lag 3 shows the last significant spike and therefore, this is a good starting point for the model.
+
+```{r pacf for bond yield}
+ggPacf(x = bond_yields$log_yield) +
+  labs(title = "Partial Autocorrelation Function (PACF) plot for Moody's AAA bonds log yield",
+       subtitle = "Lag 3 shows significant autocorrelation with zero afterwards; MA 3 (q = 3) may be appropriate")
+```
+
+Given the previous work, I've fitted a fractional difference ARIMA, or ARFIMA, model. All the model coefficients are significant.
+
+```{r specifying fracdiff model for log yield}
+log_yield_arfima <- fracdiff(x = head(bond_yields$log_yield, nrow(bond_yields) - 12),
+                             nar = 1, nma = 3, h = .00001)
+
+summary(log_yield_arfima)
+```
+
+For comparison, I've created an ARIMA(1, 1, 3) here to assess. However, the coefficients do not appear significant. Only MA 3 appears to have a low enough z-value to show significance.
+
+```{r developing log yield ARIMA1}
+Arima(y = head(bond_yields$log_yield, nrow(bond_yields) - 12), order = c(1, 1, 3))
+```
+
+To correct for this, I've dropped the AR term to see if a model with only moving average coefficients might be a better fit. This time, the coefficients appear significant. In addition, the model AIC is lower so this seems like a better model specification.
+
+```{r developing log yield ARIMA2}
+(log_yield_arima <- Arima(y = head(bond_yields$log_yield, nrow(bond_yields) - 12), 
+                         order = c(0, 1, 3)))
+```
+
+The model residuals for both the ARIMA and ARFIMA. Both  appear to resemble white noise and there are no ACF spikes past the significance lines. This signals that both sets of residuals do not have any identifiable pattern and are stationary. 
+
+```{r checking model residuals}
+checkresiduals(log_yield_arfima, lag = 28)
+
+checkresiduals(log_yield_arima, lag = 28)
+```
+
+Given both model have large MA order, the predictions are essentially weighted averages. The ARIMA model is especially noticeable here since it has predictions that do not change past $h = 2$, which is expected given the MA 2 order. The ARFIMA predictions are more variable but, also do not vary much. I've included the series mean to highlight that both model's predictions are in line with this value. However, these predictions do well here and come close to the actual log yield values. The series inherently lends itself well to a weight average model so both these choices shows close forecasts. 
+
+```{r accuracy comparison for arima & arfima}
+log_yield_predictions <- data.frame(
+  horizon = seq(1, 12, 1),
+  actual = tail(bond_yields$log_yield, 12),
+  arima_pred = predict(log_yield_arima, 12)$pred,
+  arfima_pred = predict(log_yield_arfima, 12)$mean,
+  series_mean = mean(bond_yields$log_yield)
+)
+
+log_yield_predictions %>%
+  custom_kable()
+```
+
+As a final component, I wanted to compare the forecasting methods using mean absolute error (MAE). For this, I developed a function to calculate the metric. My intuition here was the ARFIMA would outperform the ARIMA but, that is not the case when using MAE to evaluate the models. The ARIMA has a slightly better MAE, though the difference is small. From a technical standpoint, the ARFIMA model is likely a better choice as it deals with the long memory residuals. However, the ARIMA model shows better predictive power, though could be happenstance given it just produces a series mean with some noise. Overall, both still provide viable models to forecast the log yield for AAA Moody's bonds.
+
+```{r accuracy comparison}
+mean_abs_error <- function(actual, pred){
+  errors <- (pred %>% as.numeric() - actual)
+  abs_errors <- abs(errors)
+  mae <- mean(abs_errors) %>% round(4)
+}
+  
+data.frame(
+  model = c("ARIMA", "ARFIMA"),
+  MAE = c(
+    mean_abs_error(actual = log_yield_predictions$actual, 
+                   pred = log_yield_predictions$arima_pred),
+    mean_abs_error(actual = log_yield_predictions$actual, 
+                   pred = log_yield_predictions$arfima_pred)
+  )
+) %>% custom_kable()
+```
+
+***

@@ -1,0 +1,265 @@
+---
+title: "Arch & Garch in R"
+author: "Mark Preston"
+date: "March 8, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Assessing ETF return volatility with ARCH/GARCH
+
+This week, I'll be assessing the volatility structure for an SP500 ETF. To start, I've loaded the data in while also transforming the date column and adding in log returns. Throughout the analysis, I'll be using log returns to assess ARCH effects in the series. As seen while viewing the first five rows from the set, the ETF returns are daily starting in September 2001.
+
+```{r loading data and packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(forecast)
+library(fGarch)
+library(broom)
+library(knitr)
+library(kableExtra)
+
+theme_set(
+  theme_minimal()
+)
+
+colours <- c("dodgerblue2", "darkorange", "darkorchid3", "forestgreen")
+
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+spdr_etf <- read.table("d-spy-0111.txt", stringsAsFactors = F, header = T) %>%
+  rename(return = rtn) %>%
+  mutate(log_return = log(return + 1),
+         date = str_replace(date, "(\\d{4})(\\d{2})(\\d{2})$","\\1-\\2-\\3"),
+         date = as.Date(date))
+
+spdr_etf %>%
+  head() %>% 
+  custom_kable()
+```
+
+***
+
+###Exploratory Analysis
+
+One of the questions here will be assessing if the daily returns are significantly different from zero. To evaluate this informally, I've created density plots for both normal and log returns. Both seem to be centred around zero so my expectation would be that the t-test would be insufficient to reject the null hypothesis, though I'll formalize this later. Additionally, the distribution shapes lend insight into the series structure. Both series have very fat tails and high peaks. This is indicative of a Leptokurtic distribution.
+
+```{r spdr etf densities}
+spdr_etf_returns <- spdr_etf %>%
+  gather(key = "yield_type", value = "yield", -date)
+
+spdr_etf_returns %>%
+  ggplot(aes(yield, colour = yield_type, fill = yield_type)) +
+  geom_density(size = 1.3, show.legend = F, alpha = .5) +
+  geom_vline(xintercept = 0, size = 1.3, colour = "darkgray", alpha = .8) +
+  facet_wrap(facets = "yield_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  scale_fill_manual(values = colours) +
+  labs(title = "Density plots for SPDR ETF returns from Sept. 2001 to Sept. 2011",
+       subtitle = "Values are for both simple and log monthly returns; neither appears significantly greater than zero")
+```
+
+When reviewing the kurtosis for each distribution, each is above 10. For comparison, a normal distribution has a kurtosis of about 3, indicating these are several times higher. These are indicative of extreme events, which alludes to volatility in the series.
+
+```{r series kurtosis}
+data.frame(
+  series = c("return", "log return"),
+  kurtosis = c(
+    psych::kurtosi(spdr_etf$return),
+    psych::kurtosi(spdr_etf$log_return)
+  )
+) %>% custom_kable()
+```
+
+This intuition is confirmed in the time series plot below. The ETF returns are variable across the series with volatility clustering around 2002 and 2008. This suggests that ARCH effects are present in the returns. 
+
+```{r spdr etf series}
+spdr_etf_returns %>%
+  ggplot(aes(date, yield, colour = yield_type)) +
+  geom_line(size = 1.3, alpha = .75, show.legend = F) +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkgray", alpha = .8) +
+  facet_wrap(facets = "yield_type", scales = "free") +
+  scale_colour_manual(values = colours) +
+  labs(title = "Times series for SPDR ETF returns from Sept. 2001 to Sept. 2011",
+       subtitle = "Both return sets show unequal volatility; Ex. cluster around 2003 & 2009")
+```
+
+***
+
+###Modelling phase
+
+The exploratory insights seem to suggest that there is ARCH effects present but, I'll work to formalize this intuition. Additionally, there are a few other questions to review as well.
+
+####Is the expected log-return zero? 
+
+I suggested that the log returns did not appear significantly different from zero when reviewing the density plots. A formal t-test below confirms this given the low t-statistic and accompanying high p-value.
+
+```{r log return t-test}
+t.test(x = spdr_etf$log_return, conf.level = .95) %>%
+  tidy() %>%
+  custom_kable()
+```
+
+####Are there any serial correlations in the log returns?
+
+To review if the log returns have any serial auto-correlation, I've developed an ACF plot below. There are numerous significant spikes across the series indicating that there does appear to be auto-correlation.
+
+```{r acf plot for spdr}
+ggAcf(x = spdr_etf$log_return) +
+  ggtitle("ACF plot for SPDR log returns: Serial autocorrelation appears to be present")
+```
+
+A Box-Ljung test confirms this. The test statistic is very high, which results in the low p-value. The null hypothesis can be rejected here indicating that there is serial auto-correlation.
+
+```{r box ljung test on spdr}
+Box.test(x = spdr_etf$log_return, lag = 10, type = "Ljung") %>%
+  tidy() %>%
+  custom_kable()
+```
+
+####Is there ARCH effect in the log-returns?
+
+To check for arch effects, I'll use two methods. The first is a Box-Ljung with the centred and squared log returns. As seen, the test is significant indicating that ARCH effects are present.
+
+```{r spdr arch set up and box test}
+spdr_etf <- spdr_etf %>%
+  mutate(arch_test = log_return - mean(log_return))
+  
+Box.test(x = spdr_etf$arch_test ^ 2, lag = 10, type = "Ljung") %>%
+  tidy() %>%
+  custom_kable() 
+```
+
+The second is Engle’s ARCH test, which I've loaded below (`archTest`). The key feature to review here is the model's p-value, which signals that there is a significant ARCH effect.
+
+```{r archtest for log returns}
+archTest <- function(rtn, m = 10){
+  # Perform Lagrange Multiplier Test for ARCH effect of a time series
+  # rtn: time series
+  # m: selected AR order
+  #
+  y=(rtn-mean(rtn))^2
+  T=length(rtn)
+  atsq=y[(m+1):T]
+  x=matrix(0,(T-m),m)
+  for (i in 1:m){
+    x[,i]=y[(m+1-i):(T-i)]
+  }
+  md=lm(atsq~x)
+  summary(md)
+}
+
+archTest(rtn = spdr_etf$log_return, m = 10)
+```
+
+####Fit Gaussian ARMA-GARCH model for the log-return series (GARCH(2,1)). Perform model checking. Obtain the QQ-plot of the standardized residuals. Write down the fitted model
+
+To model log return volatility, I've developed a GARCH (2, 1) below. Not all of the coefficients are significant, which is one downside of the model. The alpha one value ($\alpha_1$) below $\frac{1}{3}$ also highlights the series has a high kurtosis. The most important summaries here are the Ljung-Box tests. Specifically, the $R^2$ tests show high p-values indicating the GARCH model captures the series volatility correctly. Since the main concern here is modelling volatility structure, this is positive. Overall, the model is a reasonable composition.
+
+```{r spdr garch}
+spdr_garch <- garchFit(~1 + garch(2, 1), data = spdr_etf$log_return, trace = F)
+
+summary(spdr_garch)
+```
+
+As specified, the GARCH model can be written as:
+
+**GARCH Model:**
+
+$r_t = \mu + \alpha_t$
+
+$\alpha_t = \sigma_t \epsilon_t$
+
+$\sigma{^2}{_t} = \alpha_0 + \alpha_1 a{^2}_{t - 1} + \alpha_2 a{^2}_{t - 2} + \beta_1 \sigma{^2}_{t - 1}$
+
+The values for these model parameters can be found below. As a note, $\alpha_0$ is coded as omega:
+
+```{r garch coefficient print out}
+spdr_garch@fit$coef %>% 
+  round(7) %>% 
+  custom_kable()
+```
+
+Reviewing the residuals, there appears to be some serial auto-correlation but, it might not be significant across 35 lags here. There is a very large spike at lag 1 but, this is the only significant lag.
+
+```{r checking model residuals}
+garch_residuals <- residuals(object = spdr_garch, standardize = T)
+
+checkresiduals(garch_residuals)
+```
+
+The strength of evidence in the Ljung-Box test for the residuals is right around .05. With the added fitted degrees of freedom, it's below. This is a judgement call but, they appear normal enough I think.
+
+```{r garch residual significance testing}
+Box.test(x = garch_residuals, lag = 35, fitdf = 5, type = "Ljung") %>%
+  tidy() %>%
+  custom_kable()
+```
+
+The QQ plot for the residuals shows heavier tails, specifically on the left side of the distribution. This indicates that the fitted values over and underestimate the actual log returns. Under the circumstances, this is expected because the series has fat tails stemming from a heavy Leptokurtic distribution.
+
+```{r qq norm for spdr garch}
+plot(spdr_garch, which = 13)
+```
+
+
+#### Build an ARMA-GARCH model with Student t innovations for the log-return series. Perform model checking and write down the fitted model.
+
+Switching up the model slightly, I've developed a second GARCH (2, 1) but, included student t innovations to account for the fat tails.As before, the most important summaries here are the Ljung-Box tests. They all show show high p-values indicating the GARCH model captures the series volatility correctly.
+
+```{r spdr garch t}
+spdr_garch_t <- garchFit(~1 + garch(2, 1), 
+                         data = spdr_etf$log_return, 
+                         trace = F,
+                         cond.dist = "std")
+
+summary(spdr_garch_t)
+```
+
+As specified, the GARCH model can be written as:
+
+**GARCH Model: Epsilon has t distribution**
+
+$r_t = \mu + \alpha_t$
+
+$\alpha_t = \sigma_t \epsilon_t$
+
+$\sigma{^2}{_t} = \alpha_0 + \alpha_1 a{^2}_{t - 1} + \alpha_2 a{^2}_{t - 2} + \beta_1 \sigma{^2}_{t - 1}$
+
+The values for these model parameters can be found below.
+
+```{r garch t coefficient print out}
+spdr_garch_t@fit$coef %>% 
+  round(7) %>% 
+  custom_kable()
+```
+
+The residuals appear to be similar to the previous model but, with a wider range. The ACF still appears borderline with serial auto-correlation.
+
+```{r checking t model residuals}
+garch_t_residuals <- residuals(object = spdr_garch_t, standardize = T)
+
+checkresiduals(garch_t_residuals)
+```
+
+Again, the test is around .05 when rounding up.
+
+```{r garch t residual significance testing}
+Box.test(x = garch_t_residuals, lag = 35, fitdf = 5, type = "Ljung") %>%
+  tidy() %>%
+  custom_kable()
+```
+
+The QQ plot for the residuals shows that the tails in this model are more normal than the Gaussian innovation model (save for a few outliers). This correction shows that the model is closer to the linear ideal given the residuals are normal IID. Given this, I think the student t innovation model is preferable here.
+
+```{r qq norm for spdr garch t}
+plot(spdr_garch_t, which = 13)
+```
+
+***

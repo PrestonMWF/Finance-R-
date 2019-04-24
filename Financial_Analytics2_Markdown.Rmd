@@ -1,0 +1,452 @@
+---
+title: "Markowitz Efficient Frontier, CAPM, and APT"
+author: "Mark Preston"
+date: "January 25, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Efficient Frontier, CAPM, and APT with Healthcare and Industrial Stocks
+
+This week's analysis will focus on doing a range of financial analytics methods on industrial and healthcare stocks from the SP500. Specifically, I'll work towards developing Efficient Frontier, CAPM, and APT for these securities.
+
+###Loading and preparing data
+
+To start, I'm loading the initial data alongside the necessary packages. The only two given data sets here are for historic federal interest rates and the stock names I'll need for the analysis. I've printed this out at the bottom, which highlights the mix of industrial and healthcare securities included here. Overall, there are 10 industrials and 6 healthcare, among them some of the more recognizable names on the SP500.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(quantmod)
+library(ggrepel)
+library(ggfortify)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+fed_rates <- read.csv("RIFSPFF_NB.csv", stringsAsFactors = F) %>%
+  rename(date = Time.Period,
+         risk_free_rate = RIFSPFF_N.B) %>%
+  mutate(date = as.Date(date, format = "%m / %d / %Y")) %>%
+  filter(date >= "2014-07-01" & date <= "2015-07-01")
+
+stock_names <- read.csv("Industrials_Health_Names.csv", 
+                        header = F,
+                        col.names = c("symbol", "name", "sector"),
+                        stringsAsFactors = F)
+
+stock_names %>%
+  custom_kable()
+```
+
+The real focus here is the actual stock prices for these companies, which I'm downloading here with `getSymbols`. Additionally, I've downloaded the healthcare and industrials index fund as well as the SP500 index as well. The date range here is between July 1, 2014 and July 1, 2015.
+
+```{r getting stock data using quantmod, message=FALSE, warning=FALSE, cache=TRUE}
+getSymbols(stock_names$symbol, from = "2014-7-1", to = "2015-7-1")
+
+getSymbols("XLV", from = "2014-7-1", to = "2015-7-1")
+
+getSymbols("XLI", from = "2014-7-1", to = "2015-7-1")
+
+getSymbols("SPY", from = "2014-7-1", to = "2015-7-1")
+```
+
+This series of downloads yields 19 separate securities series with 252 observations each. Since I'll be analyzing them all at the same time, I've taken the adjusted rate from each security and brought it into the same data frame. I've included the `head` from first six columns below. With the data arranged as necessary, the analytical work can proceed. 
+
+```{r creating stock data frame}
+industry_health_stocks <- cbind(
+  ABT[,6], AET[,6], CAT[,6], FDX[,6], GE[,6], HON[,6], HUM[,6], JNJ[,6], LMT[,6],
+  MDT[,6], NOC[,6], PFE[,6], UNP[,6], UPS[,6], UTX[,6], WM[,6], XLV[,6], XLI[,6],
+  SPY[,6] 
+  ) %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "date") %>%
+  mutate(date = as.Date(date)) %>%
+  rename_all(function(x) gsub(replacement = "", x = x, pattern = ".Adjusted")) %>%
+  rename_all(function(x) tm::removePunctuation(x))
+
+industry_health_stocks %>%
+  select(1:6) %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+###Efficient Frontier
+
+The Markowitz Efficient Frontier is a classical tool for portfolio management as it provides the expected return (mean) and risk or volatility (standard deviation) for a collection of securities. The ideal mix consists of securities that offer the highest expected returns for the lowest risk. Here, the idea is that because there is an inherent trade-off between risk and reward, plotting the mean versus standard deviation helps identify the most suitable securities (Investopedia, 2018). To find the efficient frontier, I've developed a data frame here with the mean and standard deviation for the initial securities. These have also been converted to log returns as well. I've also included the full name and sector as well so the interpretation is clearer.
+
+```{r deriving sd and means for stocks, warning=FALSE, message=FALSE}
+fed_mean <- mean(fed_rates$risk_free_rate) / 100 / 360
+
+all_stock_names <- stock_names %>%
+  bind_rows(
+    data.frame(
+  symbol = c("XLV", "XLI", "SPY", "Fed"),
+  name = c("Health Index", "Industry Index", "SP500", "Fed"),
+  sector = c("Index", "Index", "SP500", "Fed")
+  )
+)
+
+stock_mean_sd <- data.frame(
+  stock_mean = apply(industry_health_stocks[,-1], 2, function(x) mean(diff(log(x)))),
+  stock_sd = apply(industry_health_stocks[,-1], 2, function(x) sd(diff(log(x))))
+) %>% 
+  rownames_to_column(var = "symbol") %>%
+  add_case(symbol = "Fed", stock_mean = fed_mean, stock_sd = 0) %>%
+  inner_join(x = ., y = all_stock_names, by = "symbol") %>%
+  select(symbol, name, sector, stock_mean, stock_sd)
+
+stock_mean_sd %>%
+  head() %>%
+  custom_kable()
+```
+
+The plot below shows each log return mean and standard deviation. I've also included the fed rate here, which stands as the benchmark for risk-free returns. Anything right of this point has far more risk. The next security with the least risk is the SP500 index, which is a portfolio of securities that broadly tracks total exchange growth. Inherently, this would be less risky than an individual stock because of how diversified it is. Beyond that, the index and individual company securities can be found.
+
+To assist with interpretation, I've included the line from the federal rate to the SP index. Anything below this line indicates a questionable trade-off between risk and expected return. The second line I've added is more free form but it makes a triangle which segments some of the highest returns relative to risk. This isn't actually a calculated efficient frontier per se, given this is a non-parametric line, but it helps frame the portfolio selection exercise nonetheless. 
+
+Using this, this securities that have a reasonable return and minimized risk can be seen. For example, Aetna has the highest mean return but, is also positioned more favourably risk wise than Humana, which shows slightly return but, far more risk. Another illuminating comparison is Aetna to Union Pacific. The securities have the same risk but, UNP has about 0.002 less expected return. This highlights why Aetna is a valuable selection. Broadly speaking, I think picking securities along the triangle's upper line makes the most sense. With this in mind, my portfolio selection is below.
+
+#####Efficient Frontier Portfolio
+
+#####- Health Index
+
+#####- Pfizer
+
+#####- Lockhead
+
+#####- Northrop 
+
+#####- Aetna
+
+```{r efficient frontier plot, fig.height=9, fig.width=12.5}
+stock_mean_sd %>%
+  ggplot(aes(stock_sd, stock_mean, label = name)) +
+  geom_point(aes(colour = sector), size = 4) +
+  geom_text_repel() +
+  geom_abline(slope = .245, intercept = -.0016,
+              colour = "darkgray", size = 1.3, alpha = .33) +
+  geom_abline(slope = .034, 
+              intercept = stock_mean_sd$stock_mean[stock_mean_sd$symbol == "Fed"], 
+              colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_x_continuous(breaks = seq(0, .5, .0025)) +
+  scale_y_continuous(breaks = seq(-.1, .1, .0005)) +
+  scale_colour_manual(values = c("forestgreen", "dodgerblue2", "darkorchid", 
+                                 "darkorange", "firebrick2")) +
+  labs(title = " Efficient Frontier for mix of Healthcare & Industrial stocks",
+       subtitle = " Symbols along the curved edge of the plot represent optimal combination of securities that maximizes return given risk \n Selections: Health Index, Pfizer, Lockhead, Northrop, and Aetna all seem reasonable",
+       x = "Volatility (Standard Deviation)",
+       y = "Expected Return (Mean)",
+       colour = "Security")
+```
+
+This portfolio only contains five securities, and could be expanded, but it's a good starting point. Interestingly, there are two health stocks and the health index, which is high considering there were only six to start with. Abbott was on the cusp as well which would have increased the industrial disparity. Two defence companies, Northrop Grumman and Lockheed Martin, round out the portfolio. Overall, it appears the industrial stocks were less desirable choices in this instance.
+
+```{r stock pick review}
+stock_mean_sd %>%
+  filter(symbol %in% c("XLV", "PFE", "LMT", "NOC", "AET")) %>%
+  arrange(desc(stock_mean, stock_sd)) %>%
+  custom_kable()
+```
+
+***
+
+###Capital Asset Pricing Model (CAPM)
+
+CAPM is a modelling technique that produces a regression coefficient (beta) that measures how much risk a security adds to a portfolio. If the security is riskier than the market, it will have a beta greater than 1, and vice versa. This means a portfolio can be diversified to reduce risk. Picking up these dynamics means that CAPM is used as a portfolio optimization tool.
+
+The equation highlights this: $ER_i = R_f + \beta(ER_m - R_f)$. The expected return is derived from the risk-free rate + $\beta$ and multiplied by the expected return minus the risk free rate, which is the market risk premium (Investopedia, 2018). Below, this sets up a regression equation where log excess returns is the outcome variable and log SP excess returns are the predictor. These produce a coefficient, which is beta.
+
+```{r CAPM beta development}
+fed_rates_daily <- fed_rates$risk_free_rate / 100 / 360
+
+stock_log_retuns <- industry_health_stocks %>%
+  mutate_at(vars(-1), function(x) c(0, diff(log(x))))
+
+company_log_excess <- apply(stock_log_retuns[,-1], 2, 
+                        function(x) x - fed_rates_daily)
+
+company_log_betas <- data.frame(
+  beta = apply(company_log_excess, 2, function(z)
+    lm(z ~ -1 + company_log_excess[,"SPY"])$coefficients)
+  ) %>% rownames_to_column(var = "symbol")
+
+company_log_betas <- stock_mean_sd %>%
+  select(-stock_sd) %>%
+  left_join(x =. , y = company_log_betas, by = "symbol") %>%
+  mutate_all(function(x) ifelse(is.na(x), 0, x))
+
+company_log_betas %>%
+  head() %>%
+  custom_kable()
+```
+
+The CAPM visualization can be seen below where the company betas are in a scatter plot against the returns. The gray line is again the adjusted risk-free line, which means companies below are overvalued because they add more risk while not maintaining market returns. This means that they are overvalued. Conversely, the securities above are undervalued. Notably, the portfolio I selected in the Efficient Frontier portion all appear undervalued. That said, three of five have betas over one indicating there might be some additional risk in the portfolio.
+
+One important point is that the stocks below the line with betas less than one offer an opportunity to diversify risk. This is because a beta below 1, which is the market beta, are less variable than the SP500 here. This is desirable because they are less variable than the market. A company like Humana might be a good add because it is still well above the line but, has a beta less than one. For portfolio construction, the new betas can also be used to determine how much a security needs to rise in order to be comparable with the line. 
+
+Finally, the theory here suggests that each side should move towards line. Rationale investors will liquidate overvalued positions in favour of undervalued securities. This creates a dynamic where the undervalued stocks see price raises due to increased demand whereas overvalued stocks drop. While in practice this may not be a reasonable assumption, CAPM still offers some good insight into relative market fluctuations against returns.
+
+```{r CAPM plot, fig.height=9, fig.width=12.5}
+company_log_betas %>%
+  ggplot(aes(beta, stock_mean, label = name)) +
+  geom_point(aes(colour = sector), size = 4) +
+  geom_text_repel() +
+  geom_abline(slope = .000252, 
+              intercept = company_log_betas$stock_mean[stock_mean_sd$symbol == "Fed"], 
+              colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_x_continuous(breaks = seq(0, 3, .25)) +
+  scale_y_continuous(breaks = seq(-.1, .1, .0003)) +
+  geom_vline(xintercept = 1, colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_colour_manual(values = c("forestgreen", "dodgerblue2", "darkorchid", 
+                                 "darkorange", "firebrick2")) +
+  labs(title = "Capital Asset Pricing Model (CAPM) plot for mix of Healthcare & Industrial stocks",
+       subtitle = "Securities above line are undervalued and below are overvalued; Indicates market will pick up this trend making it shift", 
+       x = "Beta (Regression Coefficient from CAPM)",
+       y = "Expected Return (Mean)",
+       colour = "Security")
+```
+
+As a final review, I've shown the portfolio I put together with each beta. I noted that I maybe had more risk exposure given the high betas show I've added Humana here. This still adds high mean returns but, also reduces some risk exposure. I think this leaves my portfolio slightly optimized.
+
+```{r reviewing portfolio risk}
+company_log_betas %>%
+  filter(symbol %in% c("XLV", "PFE", "LMT", "NOC", "AET", "HUM")) %>%
+  arrange(desc(beta)) %>%
+  custom_kable()
+```
+
+***
+
+###Arbitrage Pricing Theory (APT)
+
+For the final section, I'll be using the portfolio I've developed to construct Arbitrage Pricing models. These help signal which of these stocks might be over or undervalued but, with more complexity than the CAPM approach due to more terms. These are linear models that attempt to predict asset return while considering macroeconomic variables. One of the overarching ideas here is that securities are not always correctly priced and these models can identify arbitrage opportunities (Investopedia, 2018). To start, I've taken the log returns for each security.
+
+```{r calculating log returns for portfolio}
+portfolio_returns <- industry_health_stocks %>%
+  select("XLV", "PFE", "LMT", "NOC", "AET", "HUM") %>%
+  mutate_all(function(x) c(0, diff(log(x)))) %>%
+  slice(-1)
+
+portfolio_returns %>%
+  head() %>%
+  custom_kable()
+```
+
+Next, I've downloaded the three outside factors for the exercise. These factors serve as proxies for the stock market (SPY), banking sector index (^BKX) and technology sector index (^XCI). These are primarily being used for naming the principle components but, are also used in the factor modelling as well.
+
+```{r setting up three factors, warning=FALSE, message=FALSE, cache=TRUE}
+getSymbols("^BKX", from = "2014-7-1", to = "2015-7-1")
+
+getSymbols("^XCI", from = "2014-7-1", to = "2015-7-1")
+
+three_factors <- cbind(BKX[,6], XCI[,6], SPY[,6]) %>%
+  as.data.frame() %>%
+  rename_all(function(x) gsub(replacement = "", x = x, pattern = ".Adjusted")) %>%
+  rename_all(function(x) tm::removePunctuation(x)) %>%
+  mutate_all(function(x) c(0, diff(log(x)))) %>%
+  slice(-1)
+
+three_factors %>%
+  head() %>%
+  custom_kable()
+```
+
+The actual stock factors are derived using principle components analysis (PCA). I'll be carrying two components forward, which means about 60% of the return variance is captured in the factors.
+
+```{r principle components on portfolio}
+portfolio_pca <- princomp(portfolio_returns)
+
+cumsum(portfolio_pca$sdev / sum(portfolio_pca$sdev)) %>%
+  custom_kable()
+```
+
+Below, I've collected the factor loadings and scores needed for PCA interpretation and modelling.
+
+```{r collecting pca return objects}
+return_factors <- portfolio_pca$scores[,1:2] %>%
+  as.data.frame() 
+
+return_loadings <- portfolio_pca$loadings[,1:2] %>%
+  as.data.frame() %>%
+  mutate(symbol = c("XLV", "PFE", "LMT", "NOC", "AET", "HUM"),
+         alpha = portfolio_pca$center) %>%
+  rename_all(function(x) gsub(pattern = "Comp.", 
+                              replacement = "PCA", 
+                              x = x)) %>%
+  select(symbol, alpha, everything())
+```
+
+Visualizing the PCA loadings provides some insight into what they might represent. For example, the first shows all stocks as negative, which might signal they capture broad market decline between health and industrials. More widely, they may be signalling general market decline. The second is less clear with only Humana having a large positive spike.
+
+```{r pca factor loading plot}
+return_loadings %>%
+  select(-alpha) %>%
+  gather(key = "pca", value = "pca_loadings", -symbol) %>%
+  ggplot(aes(symbol, pca_loadings, fill = pca)) +
+  geom_col(show.legend = F) +
+  facet_wrap(facets = "pca", nrow = 1) +
+  geom_hline(yintercept = 0, alpha = .5, size = 1.3, colour = "darkgray") +
+  scale_y_continuous(breaks = seq(-1, 1, .2)) +
+  coord_flip() +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  scale_fill_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Faceted bar charts for factor loadings from each principle component",
+       subtitle = "Plot highlights loadings to be used for factor naming: Ex. PCA1 as low market returns",
+       y = "pca loadings",
+       x = NULL)
+```
+
+To test the first hypothesis on the component representing market decline, I've plotted PCA 1 against the SP500 returns. The plot shows a medium, and nearly strong, negative correlation. As such, this component can be thought  of a broad market decline.
+
+```{r full market vs pca 1}
+three_factors %>%
+  mutate(PCA1 = return_factors$Comp.1) %>%
+  ggplot(aes(SPY, PCA1)) +
+  geom_point(colour = "darkorchid", alpha = .75) +
+  geom_smooth(method = "lm", se = F) +
+  labs(title = paste("SP500 returns vs PCA1; correlation = ",
+                     cor(three_factors$SPY, return_factors$Comp.1) %>% round(3)),
+       subtitle = "Scatterplot shows medium strength negative correlation indicating PCA1 captures broad market decline")
+```
+
+The second component naming is less clear. It appears that while the component has negative correlations with both, the spread between the indices is not significant. The regression line is slightly positive but, only by a small amount. As such, this component has no clear naming.
+
+```{r pca2 scatterplot}
+three_factors %>%
+  mutate(PCA2 = return_factors$Comp.2,
+         bank_tech_spread = XCI - BKX) %>%
+  select(-SPY) %>%
+  gather(key = "variable", value = "value", -PCA2) %>%
+  ggplot(aes(value, PCA2)) +
+  geom_point(colour = "darkorchid", alpha = .75) +
+  geom_smooth(method = "lm", se = F) +
+  facet_wrap(facets = "variable", scales = "free") +
+  labs(title = "Index returns vs PCA2",
+       subtitle = "Scatterplot shows medium strength negative correlation with bank and tech indices but, not their spread")
+
+return_factors <- return_factors %>%
+  rename(market_down = "Comp.1",
+         unnamed = "Comp.2")
+```
+
+With the interpretation complete, I've constructed linear models for both PCA factors. The first uses PCA 1 as the outcome and SPY, the SP index, as the predictor. While the intercept is not significant, the SP index slope coefficient shows a very low p-value indicating the strength of evidence for significance is high. The coefficient is negative as well, which was first seen in the scatter plot between the variables.
+
+The model fit looks poor though. There's an adjusted $R^2$ of .4314, which means that the SPY explains about 43% of the variance in PCA 1. While this is a lot for a simple linear model, it is still low. Overall, the model's p-value is very low as well indicating the wider relationship between the variables is highly significant.
+
+```{r factor model dev}
+factor_one_lm <- lm(return_factors$market_down ~ three_factors$SPY)
+
+factor_two_lm <- lm(return_factors$unnamed ~ I(three_factors$XCI - three_factors$BKX))
+
+summary(factor_one_lm)
+```
+
+The residuals appear to have some pattern while the Q-Q plot shows that there are fat tails present.
+
+```{r model 1 diagnostics}
+autoplot(factor_one_lm)
+```
+
+The second model is terrible, There are no significant features between intercept, slope, and overall fit. The adjusted $R^2$ is actually slightly negative, which means R fit the model slightly worse than a straight line guess. This model is unusable.
+
+```{r model 2 summary}
+summary(factor_two_lm)
+```
+
+I've included diagnostics but, with such a poor model they are somewhat unneeded.The Q-Q plot appears more normal here with at least one outlier (point 229).
+
+```{r model 2 diagnostics}
+autoplot(factor_two_lm)
+```
+
+The density plot for each model's residuals can be found below. The Q-Q plots highlighted the residual distribution likely had fat tails, which is confirmed here. The distributions appear more Leptokurtic than normal.
+
+```{r model residual density plot}
+data.frame(
+  model = c("factor_one", "factor_two"), 
+  residuals = c(factor_one_lm$residuals, factor_two_lm$residuals) 
+) %>%
+  ggplot(aes(residuals, fill = model)) +
+  geom_density(alpha = .75, show.legend = F) +
+  facet_wrap(facets = "model") +
+  geom_vline(xintercept = 0, size = 1.3, colour = "darkgray") +
+  scale_fill_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Residual density plots for both factor models",
+       subtitle = "Both appear generally normal but, more Leptokurtic")
+```
+
+As a final step, I've included a model to estimate the market price of risk. This is formally called the equilibrium equation for APT. To construct the model, I'll be using the PCA centres from the initial principle component work. In practice, these are equal to the intercepts from a linear model with stock returns against both principle components, which I've highlighted below.
+
+```{r checking pca centres against model}
+map_df(
+  portfolio_returns, function(z) lm(z ~ return_factors$market_down +
+                                      return_factors$unnamed)$coefficients
+  ) %>% 
+  t() %>%
+  as.data.frame() %>%
+  rename(alpha = "V1",
+         PCA1 = "V2",
+         PCA2 = "V3") %>%
+  custom_kable()
+```
+
+The model includes these pca centres minus the fed rate mean as the outcome with each security pca coefficient as the predictors. Interestingly, the model has very high $R^2$ metrics with .968 and .952 respectively. The first PCA slope coefficient is significant and the second is borderline. The strength of evidence with a .088 p-value is high but, it's debatable whether to call this significant. The slope coefficients represent market risk price estimations. The more clear one if the named PCA 1, which represents wider market downturn. The model F-test would also reject the utility hypothesis at a 5% level highlighting that there is a significant relationship between the alpha and PCA inputs.
+
+```{r market risk lm}
+market_risk_price_lm <- lm(I(alpha - fed_mean) ~. -1, 
+                           data = return_loadings[,-1])
+
+summary(market_risk_price_lm)
+```
+
+The big output here though is the residuals. The idea is that the model provides insight into the difference between mean stock return and predicted value. A positive residual signals the stock is outperforming the model prediction and therefore, is a buy candidate. The opposite is also true with a negative residual signalling under performance and therefore, a sell opportunity.
+
+However, the idea behind market efficient hypothesis suggests that these arbitrage identifications are short lived and therefore, they almost certainly do not translate to 2019. Given the changing market dynamic, the mode parameters and predictions would change on an ongoing basis. As such, these are well suited to reviewing how the market behaved at a certain period but, are probably not useful for prediction. Overall, it highlights that the portfolio I developed may have some weaknesses. Aetna was a consistent performer across all the models though which gives me confidence in keeping it.
+
+```{r equillibrium model residuals}
+return_loadings %>%
+  inner_join(x = ., y = company_log_betas, by = "symbol") %>%
+  mutate(residuals = market_risk_price_lm$residuals) %>%
+  ggplot(aes(symbol, residuals, fill = sector)) +
+  geom_col() +
+  geom_hline(yintercept = 0, colour = "darkgray", size = 1.3, alpha = .7) +
+  scale_fill_manual(values = c("dodgerblue2", "darkorchid", "darkorange")) +
+  labs(title = "Equilibrium Model Residual Plot- Positive residuals signal buy opportunity, negative sell",
+       subtitle = "Portfolio seems heavy on underperforming stocks using APT model- AET looks like good buy option here",
+       fill = "Security")
+```
+
+***
+
+###References:
+
+####1. Investopedia: "Efficient Frontier", Will Kenton, May 30, 2018
+
+####Access: https://www.investopedia.com/terms/e/efficientfrontier.asp
+
+####2. Investopedia: "Capital Asset Pricing Model (CAPM)", Will Kenton, Dec. 7, 2018
+
+####Access: https://www.investopedia.com/terms/c/capm.asp
+
+####3. Investopedia: "Arbitrage Pricing Theory (APT)", Will Kenton, June 25, 2018
+
+####Access: https://www.investopedia.com/terms/a/apt.asp
+
+***

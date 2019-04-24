@@ -1,0 +1,184 @@
+---
+title: "Pricing Options in R"
+author: "Mark Preston"
+date: "February 22, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+###European Options Pricing with Black-Scholes-Merton
+
+This week, I'll be working through options pricing using Black-Scholes-Merton and other methods. As a change of pace, there isn't any formal data set this week so I've started with getting the packages loaded. 
+
+```{r loading packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(broom)
+library(RQuantLib)
+library(NMOF)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+colours <- c("dodgerblue2", "darkorange", "darkorchid3", "forestgreen")
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+```
+
+***
+
+###The Option Scenario
+
+The working scenario here includes several working inputs. With these, I'll provide options pricing outputs. Below, I've included the starting parameters:
+
+- A stock index is currently at 810 ($S$)
+
+- The option has a strike price of 800 ($K$)
+
+- It has volatility of 20% ($\sigma$)
+
+- The risk-free rate is 5% per year ($r$)
+
+- It has a 1% dividend yield ($q$)
+
+- The European option has a 6-month expiry ($t$)
+
+####Price a European 6-month call option with strike 800 using EuropeanOption()
+
+The `EuropeanOption` function operationalizes the Black-Scholes-Merton (BSM) equation. The BSM model uses various security inputs to determine the fair market price of an option. Below, I've used the function to generate the call options metrics for the given parameters. As seen, the call here is priced at about $53.72,
+
+```{r BSM euro option}
+option_summary <- function(option){
+  EuropeanOption(type = option, 
+                 underlying = 810, 
+                 strike = 800, 
+                 dividendYield = .01, 
+                 riskFreeRate = .05, 
+                 maturity = .5, 
+                 volatility = .2) %>%
+    unlist() %>%
+    as.data.frame() %>%
+    rownames_to_column(var = paste0(option, "_metric")) %>%
+    rename(value = ".") %>%
+    mutate(value = round(value, 4))
+}
+
+call_option_summary <- option_summary(option = "call")
+
+put_option_summary <- option_summary(option = "put")
+
+call_option_summary %>%
+  custom_kable()
+```
+
+
+####Calculate the same premium manually. Describe how dividend yield should affect option price
+
+Breaking down the equation, I've calculated the BSM model manually. Here, the dividend effect on option price can be reviewed. In the formula, $q$ is subtracted from the risk free rate ($r$) while also impacting the final call valuation by augmenting the underlying asset price ($S$). In this way, it discounts the stock price. The idea behind this is that call options are diminished leading up to a dividend date because there is an expected fall in the underlying asset. This is related to the ex-dividend date, where dividends are paid, and the stock is expected to drop by that amount (Investopedia, 2019). In the same vein, put options should increase in price.
+
+The implementation I developed (`BSM_Euro_call`) shows the same call valuation when compared to the `EuropeanOption` approach validating my translation of the formula into R.
+
+```{r manual bsm}
+BSM_Euro_call <- function(S, K, r, q, t, sigma) {
+  d1  <-  (log(S / K) + (r - q + (sigma ^ 2) / 2) * t) / (sigma * sqrt(t))
+  d2  <-  d1 - sigma * sqrt(t)
+  value <- (S * exp((-q) * t) * pnorm(d1)  - K * exp(-r * t) * pnorm(d2))
+  return(round(value, 4))
+}
+
+data.frame(
+  method = c("RQuantLib", "Manual BSM"),
+  call_value = c( 
+    call_option_summary$value[1],
+    BSM_Euro_call(S = 810, K = 800, r = .05, q = .01, t = .5, sigma = .2)
+  )
+) %>% custom_kable()
+```
+
+To review how changing the dividend yield affects options prices, I've run a simulation below. To do so, I've used a combination of `cross2` and `map` which effectively runs `EuropeanOption` with call and put options alongside dividend yields ranging from .001 to .1. Of course there probably isn't too securities with a 10% dividend yield but, conceptually it highlights how higher dividends affect option pricing. The plot shows the inverse relationship between call and put options as dividend yield increases.
+
+```{r changing dividend yield with BSM}
+option_type <- c("call", "put")
+
+dividend_yield <- seq(.001, .1, .001)
+
+dividend_option_effect <- list(
+  option = rep(option_type, times = 100),
+  dividend = rep(dividend_yield, each = 2),
+  option_value = cross2(option_type, dividend_yield) %>%
+    map(~EuropeanOption(type = .x[[1]], 
+                        underlying = 810, 
+                        strike = 800, 
+                        dividendYield = .x[[2]], 
+                        riskFreeRate = .05, 
+                        maturity = .5, 
+                        volatility = .2)$value)
+) %>% map_dfr(unlist)
+
+dividend_option_effect %>%
+  ggplot(aes(dividend, option_value, colour = option)) +
+  geom_line(size = 1.3) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  scale_x_continuous(breaks = seq(0, .1, .01)) +
+  scale_y_continuous(breaks = seq(25, 75, 3)) +
+  labs(title = "European call and put values with varying dividend yields",
+       subtitle = "Higher dividends reduce call prices while raising put value")
+```
+
+Formalizing this, I've developed a linear model for both call and put options where the price is the outcome variable and dividend rate is the predictor. This shows the relationship captured above but, further confirms the relationship is highly statistically significant for both option types when using the simulated dividend values here. 
+
+```{r lm for option price vs dividend yield}
+dividend_option_effect %>%
+  group_by(option) %>%
+  group_map(~tidy(lm(option_value ~ dividend, data = .x))) %>%
+  filter(term == "dividend") %>%
+  custom_kable()
+```
+
+####Calculate the premium of the put option with the same expiry and same strike using put-call parity
+
+I developed the put option table in a previous code chunk but, have shown it below here. Using the BSM equation, the put price is about $32.02.
+
+```{r put option table}
+put_option_summary %>%
+  custom_kable()
+```
+
+Checking the value with a different function (`putCallParity`), the option price is the same.
+
+```{r put call parity}
+data.frame(
+  method = c("RQuantLib", "NMOF"),
+  put_value = c( 
+    put_option_summary$value[1],
+    putCallParity(what = "put", 
+              call = call_option_summary$value[1], 
+              S = 810, 
+              X = 800, 
+              tau = .5, 
+              r = .05, 
+              q = .01) %>% round(4)
+  )
+) %>% custom_kable()
+```
+
+***
+
+###References
+
+####Understanding How Dividends Affect Option Prices
+
+####Access: https://www.investopedia.com/articles/active-trading/090115/understanding-how-dividends-affect-option-prices.asp
+
+***

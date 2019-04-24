@@ -1,0 +1,198 @@
+---
+title: "Price Decomposition Modelling"
+author: "Mark Preston"
+date: "March 15, 2019"
+output: html_document
+---
+
+***
+
+##High-Frequency Trading Price Models
+
+For this assignment, I'll develop a price decomposition model using high-frequency trading data. 
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(MASS)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+source("GeoSize.R")
+
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+tick <- 25
+
+hf_trading <- read.csv("hft2_trades_train.csv", stringsAsFactors = F) %>%
+  mutate(seconds = (timestamp - timestamp[1]) / 10 ^ 6,
+         price_change = c(0, diff(price)) / tick) 
+
+hf_trading %>%
+  head() %>%
+  custom_kable()
+```
+
+A price decomposition model, the high-frequency price is decomposed into 3 components:
+
+- Price change indicator ($A_i$)
+
+- Direction of price change ($D_i$)
+
+- Size of price change (if one occurs) ($S_i$)
+
+Below, I've developed all three variables for the current data.
+
+```{r decomp parameters}
+hf_trading <- hf_trading %>%
+  mutate(A = ifelse(price_change > 0 | price_change < 0, 1, 0),
+         S = abs(price_change),
+         D = case_when(
+           price_change > 0 ~ 1,
+           price_change < 0 ~ -1,
+           price_change == 0 ~ 0
+         )
+)
+
+hf_trading %>%
+  head() %>%
+  custom_kable()
+```
+
+Additionally, the model uses lagged variables for $A$, $D$, and $S$. These are inputs used for various modelling tasks that make up the wider decomposition model. Lags one and two are included here.
+
+```{r lagged decomp}
+lagged_ads <- data.frame(
+  Ai = hf_trading$A[2:19494],
+  Aim1 = hf_trading$A[1:19493],
+  Di = hf_trading$D[2:19494],
+  Dim1 = hf_trading$D[1:19493],
+  Si = hf_trading$S[2:19494],
+  Sim1 = hf_trading$S[1:19493]
+)
+
+lagged_ads %>%
+  head() %>%
+  custom_kable()
+```
+
+The decomposition model takes in several model parameters to provide the probability that price change of the next trade will be category a certain category (like -1 or +1 for example). Two parameters for this are the intercept and slope coefficient for a logistic model with $A_i$ as the outcome and the lag 1 price change indicator as the predictor.
+
+```{r glm dev}
+A_glm <- glm(Ai ~ Aim1, family = "binomial", data = lagged_ads)
+
+beta_0 <- unname(A_glm$coefficients[1])
+beta_1 <- unname(A_glm$coefficients[2])
+
+summary(A_glm)
+```
+
+The next logistic model takes the direction when the price indicator is one (i.e. price has moved) as the outcome and the lag 1 counterpart as predictor.
+
+```{r d model dev}
+di <- lagged_ads$Di[lagged_ads$Ai == 1]
+dim1 <- lagged_ads$Dim1[lagged_ads$Ai == 1]
+di <- (di + abs(di)) / 2 
+
+d_glm <- glm(di ~ dim1, family = "binomial")
+
+gamma_0 <- unname(d_glm$coefficients[1])
+gamma_1 <- unname(d_glm$coefficients[2])
+
+summary(d_glm)
+```
+
+The next two models are geometric regression, both of which focus on the size of a price change when it's either positive or negative. The first one is size when direction is 1.
+
+```{r s model dev}
+si <- lagged_ads$Si[lagged_ads$Di == 1]
+sim1 <- lagged_ads$Sim1[lagged_ads$Di == 1]
+
+s_model <- GeoSize(si, sim1)
+
+theta_u0 <- unname(s_model$par[1])
+theta_u1 <- unname(s_model$par[2])
+```
+
+The second is size when direction is negative.
+
+```{r ns model dev}
+neg_si <- lagged_ads$Si[lagged_ads$Di == -1]
+neg_sim1 <- lagged_ads$Sim1[lagged_ads$Di == -1]
+
+neg_s_model <- GeoSize(neg_si, neg_sim1)
+
+theta_d0 <- unname(neg_s_model$par[1])
+theta_d1 <- unname(neg_s_model$par[2])
+```
+
+With the four models developed, all the decomposition model parameters can be collected, which I've done below.
+
+```{r collecting all decomp parameters}
+decomp_params <- list(beta_0 = beta_0, beta_1 = beta_1,
+                      gamma_0 = gamma_0, gamma_1 = gamma_1,
+                      theta_u0 = theta_u0, theta_u1 = theta_u1,
+                      theta_d0 = theta_d0, theta_d1 = theta_d1)
+
+decomp_params %>%
+  unlist() %>%
+  custom_kable()
+```
+
+As mentioned, the model calculates the probability of price change for the next trade category. I've simulated ten examples below for positive, negative, and neutral tick changes alongside values for change, direction, and change size. This produces the change probabilities seen in the table. This model can be used in high frequency markets to predict how a security price will change and develop a trading strategy around it.
+
+```{r decomposition function and sim}
+pch_decomposition_cdf <- function(x, aim1, dim1, sim1, decomp_params) {  
+    pch_cdf <- 0
+    p <- plogis(decomp_params$beta_0 + decomp_params$beta_1 * aim1)    # Pr( Ai =  1 | aim1 )
+    q <- plogis(decomp_params$gamma_0 + decomp_params$gamma_1 * dim1)  # Pr( Di = +1 | dim1 )
+    
+    lambda_up = plogis(decomp_params$theta_u0 + decomp_params$theta_u1 * sim1)
+    lambda_down = plogis(decomp_params$theta_d0 + decomp_params$theta_d1 * sim1)
+    
+    if (x < 0) {
+        # P( next_pch <= x ) = Pr( Ai = 1, Di = -1, Si >= -x ) = Pr( Ai = 1, Di = -1, Si > -x-1 ) 
+        # since Si ~ 1 + geom(lambda_down) when Di = -1 we have:
+        pch_cdf <- p * (1-q) * pgeom(-x-2, prob=lambda_down, lower.tail = FALSE) 
+    } else if (x >= 0) {
+        # P( next_pch <= x ) = Pr( Ai = 0 ) + Pr( Ai = 1, Di = 1 ) + Pr( Ai = 1, Di = -1, Si <= x ) = 
+        # = (1-p) + p*(1-q) + Pr( Ai = 1, Di = 1, Si <= x ) 
+        # since Si ~ 1 + geom(lambda_up) when Di = 1 we have:
+        pch_cdf <- (1-p) + p * (1-q) + p * q * pgeom(x-1, prob=lambda_up)
+    }
+    
+    return(pch_cdf)
+}
+
+tick_changes <- c(-1, 0, 1)
+
+A_sim <- c(1, 0)
+
+D_sim <- c(1, -1)
+
+S_sim <- seq(1:5)
+
+price_decomp_sim <- function(sim){
+  price_movement <- data.frame(
+    simulation = sim,
+    tick_change = sample(x = tick_changes, size = 1),
+    change = sample(x = A_sim, size = 1)
+  ) %>%
+    mutate(direction = ifelse(change == 1, sample(x = D_sim, size = 1), 0),
+           change_size = ifelse(change == 1,  sample(x = S_sim, size = 1), 0),
+           change_prob = pch_decomposition_cdf(x = tick_change, 
+                                               aim1 = change, 
+                                               dim1 = direction, 
+                                               sim1 = change_size, 
+                                               decomp_params = decomp_params)
+           )
+  
+  return(price_movement)
+}
+
+map_df(1:10, function(x) price_decomp_sim(sim = x)) %>%
+  custom_kable()
+```
+
+***

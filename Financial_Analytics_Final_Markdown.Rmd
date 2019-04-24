@@ -1,0 +1,1072 @@
+---
+title: "Portfolio Development with SP500 Securities Using Applied Financial Mathematics"
+author: "Mark Preston"
+date: "March 23, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Part 1: Efficient Frontier, CAPM, and Market-Neutral Portfolio Construction using SP500 Stocks
+
+***
+
+For the final assignment, I'll be working through a portfolio construction analysis using various financial analytics methods. For this, I'll be using an assortment of nearly 300 SP 500 stocks from 2014. Beginning the analysis, I've loaded the necessary stock data and transformed the date column. The first five rows with the first five columns are shown below. In addition to individual securities, the data also contains the SP 500 index and the fed fund rate, which will be used as the risk-free rate.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(broom)
+library(ggfortify)
+library(urca)
+library(fArma)
+library(tidyverse)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+sp500_2014 <- read.csv("SP500_Stocks_Portfolio.csv") %>%
+  mutate(Date = as.Date(Date, origin = "1899-12-30"))
+
+sp500_2014 %>%
+  select(1:5) %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+###Efficient Frontier
+
+With the data prepared, the efficient frontier work can proceed. The goal of this analysis is to develop a tool for portfolio management as it provides the expected return (mean) and risk or volatility (standard deviation) for a collection of securities. When plotting the returns against the volatility, a security's risk-reward trade-off can be reviewed.
+
+####Calculate means and standard deviations of daily log-returns for each company and the SP index. Include the Fed Fund mean as well
+
+As part of this, I've developed the mean (expected return) and standard deviation (volatility or risk) for each security. This calculation is done using the differenced log returns. The output preview can be seen below.
+
+```{r calculating efficient frontier values}
+fed_mean <- mean(sp500_2014$FFRate) / 100 / 250
+
+stock_mean_sd <- data.frame(
+  stock_mean = apply(sp500_2014[,-c(1,3)], 2, function(x) mean(diff(log(x)))),
+  stock_sd = apply(sp500_2014[,-c(1,3)], 2, function(x) sd(diff(log(x))))
+) %>% 
+  rownames_to_column(var = "symbol") %>%
+  add_case(symbol = "Fed", stock_mean = fed_mean, stock_sd = 0) %>%
+  mutate(sector = case_when(
+    symbol == "Fed" ~ "Fed",
+    symbol == "SPY" ~ "SP500",
+    symbol != "Fed" | symbol != "SPY"~ "Stock"
+  )
+) %>%
+  select(symbol, sector, everything())
+
+stock_mean_sd %>%
+  head() %>%
+  custom_kable()
+```
+
+####Plot the SPY companies on standard deviation-mean diagram to observe the efficient frontier. Add the points for SPY and risk-free rate while adding the Capital Allocation Line connecting the points of risk-free rate and SPY. Also add efficient frontier tagent.
+
+Below, I've constructed the efficient frontier visualization. The scatter plot shows the securities mean and standard deviations, which makes the parabolic efficient frontier shape. To highlight this more, I've included its tangent line (coloured gold). The point that the line passes through is KR (Kroger Co), a large supermarket and general retailer.
+
+####Why is the point representing SPY located at the tip of the frontier?
+
+Of note, the orange point representing the SP500 index is at the tip of the efficient frontier. For an explanation of this, the plot's concept has to be revisited again. The efficient frontier helps shows the trade-off between returns and volatility. For example, the Fed free point shows a volatility of zero given its risk free and therefore, without and standard deviation. As a result of having no risk, it has the lowest mean return. The next point with the lowest volatility is SPY, the SP index fund. This is because it's an amalgamation of securities that tracks the broad returns of the SP 500 and as such, has diversified risk. Inherently, this lowers the risk while also settling for market returns as well. With this in mind, it has ameliorated risk and returns that are lower than any individual security in the SP500, hence being the first point in the efficient frontier.
+
+```{r efficient frontier plot}
+spy_fed_slope <- stock_mean_sd %>%
+  filter(symbol %in% c("SPY", "Fed")) %>%
+  lm(stock_mean ~ stock_sd, data = .) %>%
+  coefficients() %>%
+  as.data.frame() %>%
+  slice(-1)
+
+kr_fed_slope <- stock_mean_sd %>%
+  filter(symbol %in% c("KR", "Fed")) %>%
+  lm(stock_mean ~ stock_sd, data = .) %>%
+  coefficients() %>%
+  as.data.frame() %>%
+  slice(-1)
+
+stock_mean_sd %>%
+    ggplot(aes(stock_sd, stock_mean, colour = sector)) +
+    geom_jitter(size = 2.5, alpha = .5) +
+    geom_abline(slope = spy_fed_slope$.[1], 
+                intercept = 0, colour = "darkgray", size = 1.3, alpha = .33) +
+    geom_abline(slope = kr_fed_slope$.[1], 
+                intercept = 0, colour = "darkgoldenrod1", size = 1.3, alpha = .33) +
+    geom_vline(xintercept = stock_mean_sd$stock_sd[stock_mean_sd$symbol == "SPY"],
+               colour = "darkgray", size = 1.3, alpha = .33) +
+    scale_y_continuous(expand = c(0, .001, 0, .004)) +
+    scale_colour_manual(values = c("forestgreen", "darkorange", "dodgerblue2")) +
+    labs(title = "Efficient Frontier for mix of SP500 stocks with Fed Rate and SPY",
+         subtitle = "Symbols along the edge of capitol allocation line (gold) represent optimal mix of securities that maximizes return given risk",
+         x = "Volatility (Standard Deviation)",
+         y = "Expected Return (Mean)",
+         colour = "Security")
+```
+
+Just to reemphasize this point, I've arranged the securities in the set by lowest standard deviation. As expected, the Fed and SPY rates have the two lowest volatilities.
+
+```{r low stock sd review}
+stock_mean_sd %>%
+  arrange(stock_sd) %>% 
+  slice(1:5) %>%
+  custom_kable()
+```
+
+####Plot cumulative returns of SPY and the tangent line stock. Create portfolio for the risk free investment and KR that has the same risk as SPY.
+
+As seen below, I've developed a plot with the mixed portfolio. The mixture weight is derived by dividing the standard deviation from SPY with the standard deviation from KR. This weight is then used to develop the mixed portfolio where the Fed mean and KR are combined. As seen, the cumulative returns here are broadly between KR and SPY.
+
+```{r mixed portfolio viz}
+kr_mixed_weight <- stock_mean_sd %>%
+  filter(symbol %in% c("SPY", "KR")) %>%
+  summarise(value = stock_sd[1] / stock_sd[2])
+
+mixed_kr_portfolio <- (1 - kr_mixed_weight$value) * 
+  rep(fed_mean, length(sp500_2014[,1])) + kr_mixed_weight$value *
+  c(0, diff(log(sp500_2014$KR)))
+
+mixed_portfolio <- sp500_2014 %>%
+  select(Date, SPY, KR) %>%
+  mutate_at(vars(-Date), function(x) c(0, diff(log(x)))) %>%
+  mutate(cume_spy_return = cumsum(SPY),
+         cume_kr_return = cumsum(KR),
+         mixed_portfolio =  cumsum(mixed_kr_portfolio)) %>%
+  select(-KR, -SPY) %>%
+  gather(key = "Security", value = "cume_return", -Date)
+
+mixed_portfolio %>%
+  ggplot(aes(Date, cume_return, colour = Security)) +
+  geom_line(size = 1.3) +
+  geom_hline(yintercept = 0, colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_y_continuous(breaks = seq(-1, 1, .1)) +
+  scale_colour_manual(values = c("darkgoldenrod1", "darkorchid", "dodgerblue2")) +
+  labs(title = "Cumulative Returns for SPY and KR over 2014",
+       subtitle = "Mixed portfolio offers stronger returns than SPY",
+       y = "Cumulative Returns")
+```
+
+This mixture ensures that the new portfolio has the same risk as SPY, which can be seen in the comparison table below. 
+
+```{r checking risk is same as spy}
+data.frame(
+  portfolio = c("SPY", "Mixed"),
+  risk = c(
+    sd(diff(log(sp500_2014$SPY))),
+    sd(mixed_kr_portfolio)
+  )
+) %>% custom_kable()
+```
+
+
+***
+
+###Capital Asset Pricing Model (CAPM)
+
+CAPM is a modelling technique that produces a regression coefficient (beta) that measures how much risk a security adds to a portfolio. If the security is riskier than the market, it will have a beta greater than 1, and vice versa. This means a portfolio can be diversified to reduce risk. Picking up these dynamics means that CAPM is used as a portfolio optimization tool. The output here highlights each symbol has a beta, or slope coefficient, which captures its risk relative the market index. 
+
+```{r capm set up}
+fed_rates_daily <- (sp500_2014$FFRate / 100 / 365)[1:249]
+
+company_log_betas <- sp500_2014 %>%
+  select(-1, -3) %>%
+  mutate_all(function(x) c(0, diff(log(x)))) %>%
+  slice(-1) %>%
+  apply(., 2, 
+        function(z) lm(I(z - fed_rates_daily) ~ -1 +                                     I(diff(log(sp500_2014$SPY))- fed_rates_daily))$coefficients
+    ) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "symbol") %>%
+  select(symbol, beta = ".")
+
+company_log_betas <- stock_mean_sd %>%
+  select(-stock_sd) %>%
+  left_join(x =. , y = company_log_betas, by = "symbol") %>%
+  mutate_all(function(x) ifelse(is.na(x), 0, x))
+
+company_log_betas %>%
+  head() %>%
+  custom_kable()
+```
+
+To better highlight the betas, I've plotted them below. The collection of betas seems higher than the line as a guess, which would indicate these are slightly above average for risk when compared to the market index. Additionally, each beta also provides an estimate of the security's excess log returns to the SPY excess log return.
+
+```{r stock beta plot}
+company_log_betas %>%
+  mutate(index = row_number()) %>%
+  ggplot(aes(index, beta, colour = sector)) +
+  geom_jitter(size = 2.5, alpha = .4) +
+  geom_hline(yintercept = 1, colour = "darkgray", size = 1.3, alpha = .33) +
+  labs(title = "CAPM betas for SP500 portfolio stocks",
+       subtitle = "Values over 1 indicates security riskier than the market index (SPY); SPY value = 1 for this reason",
+       colour = "Sector")
+```
+
+####Select stocks Coca-Cola (KO), Plum Creek Timber (PCL) and Kroger (KR). Find their betas.
+
+I've isolated the betas for the three select companies below. Each shows a beta value less than 1, indicating that these have slightly less volatility when the market is moving.  
+
+```{r selecting choice stocks}
+company_log_betas %>%
+  filter(symbol %in% c("KR", "KO", "PCL")) %>%
+  custom_kable()
+```
+
+####Create plot for the Betas-Mean Return space. According to the CAPM model, which of the selected stocks should have been bought in 2014 and which should have been shorted?
+
+The CAPM visualization can be seen below where the company betas are in a scatter plot against the returns. The gray line is again the adjusted risk-free line, which means companies below are overvalued because they add more risk while not maintaining market returns. This means that they are overvalued. Conversely, the securities above are undervalued. Using this criteria, not all of the three selected stocks appear above the line. Both KO (Coca-Cola) and KR (Kroger) do though, although Coke is essentially on the line suggesting it's priced reasonably fair. For a long portfolio, Kroger would be the most appropriate choice. On the other side, PCL (Plum Creek Timber) is overvalued and as such, I wouldn't have purchased it. This would be the most ideal short candidate from the three selected stocks.
+
+```{r beta vs mean plot}
+spy_fed_slope_capm <- company_log_betas %>%
+  filter(symbol %in% c("SPY", "Fed")) %>%
+  lm(stock_mean ~ beta, data = .) %>%
+  coefficients() %>%
+  as.data.frame() %>%
+  slice(-1)
+
+company_log_betas %>%
+  mutate(select_stock = case_when(
+    symbol == "KR" ~ "KR",
+    symbol == "KO" ~ "KO",
+    symbol == "PCL" ~ "PCL",
+    symbol == "SPY" ~ "SPY",
+    symbol == "Fed" ~ "Fed", 
+    !symbol %in% c("KR", "KO", "PCL", "SPY", "Fed") ~ "Non-Select"
+  )
+) %>%
+  mutate(select_stock = factor(select_stock, levels = c("Fed", "SPY", 
+                                                        "KO", "KR", 
+                                                        "PCL", "Non-Select"))) %>%
+  ggplot(aes(beta, stock_mean, colour = select_stock)) +
+  geom_jitter(size = 2.5, alpha = .4) +
+  geom_abline(slope = spy_fed_slope_capm$., 
+              intercept = company_log_betas$stock_mean[stock_mean_sd$symbol == "Fed"], 
+              colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_x_continuous(breaks = seq(0, 3, .25)) +
+  geom_vline(xintercept = 1, colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_colour_manual(values = c("forestgreen", "darkorange", "firebrick2", 
+                                 "darkorchid", "darkgoldenrod1", "dodgerblue2")) +
+  labs(title = " Capital Asset Pricing Model (CAPM) plot for mixed SP500 stocks",
+       subtitle = " Securities above line are undervalued and below are overvalued; Indicates market will pick up this trend making it shift \n Portfolio construction: Buy KR & possibly KO while shorting PCL", 
+       x = "Beta (Regression Coefficient from CAPM)",
+       y = "Expected Return (Mean)",
+       colour = "Security")
+```
+
+####Market-Neutral Portfolio
+
+Creating a market neutral portfolio can be done if it has a mixture of long and short positions that are equal when developed or, periodically maintained to be equal. This portfolio weighting can be developed by taking an initial value capturing the long to short ratio. Below, using the selected stocks, I've done this using PCL and KR. The value suggests that to construct the market neutral portfolio, for each PCL share shorted there should be 2.24 KR purchased.
+
+```{r plotting long portfolio value}
+long_portfolio_weight <- sp500_2014$PCL[1] / sp500_2014$KR[1]
+
+data.frame(
+  weight_type = "long weight",
+  value = long_portfolio_weight
+  ) %>%
+  custom_kable()
+```
+
+With the weight developed, the yearly return line for the portfolio can be created by subtracting the KR price from PCL and multiplying it by the long weight. 
+
+```{r weight portfolio purchases}
+sp500_2014 %>%
+  mutate(market_neutral_value = long_portfolio_weight * KR - PCL,
+         market_neutral_return = market_neutral_value / 250,
+         index = row_number()) %>%
+  select(market_neutral_value, market_neutral_return, index) %>%
+  gather(key = "series", value = "value", -index) %>%
+  ggplot(aes(index, value, colour = series)) +
+  geom_line(size = 1.3, show.legend = F) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  facet_wrap(facets = "series", scales = "free") +
+  labs(title = "Long weight * KR - PNL: Line provides market return line across 2014",
+       subtitle = "Return derived by dividing neutral value by 250 (number of days)")
+```
+
+####Create market-neutral portfolio of stocks according to the CAPM starting at the beginning of 2014 and track its value for the rest of the year
+
+To accomplish this, the first step is deriving the intercept and slope for the Security Market Line. The intercept here is the fed mean while the slope comes from the difference between the SPY point and fed mean. I've also developed an SML function, which just contains the standard regression equation. With both of these created, the line can be created by providing the security betas to the x parameter, similar to a prediction task in a normal regression model. This creates the SML values.
+
+These values are essential to developing the portfolio, as seen in the visualization below. Essentially, the difference between the stock mean and the SML value for the security (the residual) marks whether a stock is long or short. The variable I've added here captures this relationship: if a residual is positive, or above the line, it receives a long label while negative values become short. With this, the portfolio construction can begin to take shape.
+
+```{r developing long short plot}
+capm_slope_data <- data.frame(
+  a = fed_mean,
+  b = stock_mean_sd$stock_mean[1] - fed_mean
+  )
+
+sml <- function(a, b, x){
+  a + b * x
+}
+
+company_log_betas <- company_log_betas %>%
+  mutate(sml = sml(a = capm_slope_data$a, b = capm_slope_data$b, x = beta),
+         portfolio_position = case_when(
+           stock_mean - sml >= 0 ~ "Long",
+           stock_mean - sml <= 0 ~ "Short"),
+         portfolio_position = ifelse(symbol %in% c("Fed", "SPY"), 
+                                     "SPY & Fed", portfolio_position))
+
+company_log_betas %>%
+  ggplot(aes(beta, stock_mean, colour = portfolio_position)) +
+  geom_jitter(size = 2.5, alpha = .4) +
+  geom_abline(slope = capm_slope_data$b, 
+              intercept = capm_slope_data$a,  
+              colour = "darkgray", size = 1.3, alpha = .33) +
+  scale_colour_manual(values = c("darkgoldenrod1", "dodgerblue2", "forestgreen")) +
+    labs(title = " Capital Asset Pricing Model (CAPM) plot for mixed SP500 stocks with Long & Short positions highlighted",
+       subtitle = " Securities above line are undervalued (Long) and below are overvalued (Short)", 
+       x = "Beta (Regression Coefficient from CAPM)",
+       y = "Expected Return (Mean)",
+       colour = "Position")
+```
+
+The long and short development follows a very similar pattern so to standardize the coding, I've developed a function that finds the weights, plots them, and also returns the portfolio weight value so each side can be compared. Below, I've formalized the long selection by filtering the initial position label. As a methodological note, the weights are just each individual security residual divided by the sum of total residuals. The first five rows of these are shown. 
+
+```{r developing long weights}
+portfolio_weight_dev <- function(data, position){
+  weights <- data %>%
+    filter(portfolio_position == position) %>%
+    mutate(mal_distance = stock_mean - sml,
+           weight = mal_distance / sum(mal_distance))
+
+  weight_plot <- weights %>%
+    mutate(index = row_number()) %>%
+    ggplot(aes(index, weight)) +
+    geom_line(size = 1.3, colour = "dodgerblue2") +
+    labs(title = paste(position, "weight plot for portfolio construction"),
+         subtitle = paste("All portfolio weights sum =", sum(weights$weight)))
+ 
+  portfolio_symbols <- weights$symbol
+  
+  weighted_value <- as.matrix(sp500_2014[1,-(1:3)])[,portfolio_symbols] %*%
+    weights$weight %>% as.numeric()
+  
+  output <- list(weights = weights,
+                 weight_plot = weight_plot,
+                 weighted_value = weighted_value)
+  
+  return(output)
+  
+}
+
+long_only_weights <- portfolio_weight_dev(data = company_log_betas, 
+                                          position = "Long")
+  
+long_only_weights$weights %>%
+  head() %>%
+  custom_kable()
+```
+
+The plot shows how variable the weights are. Higher values indicate further distance from the line meaning they are the most undervalued. Weights towards zero are more in line with fair evaluation; KO (Coke) would be amongst this group given the previous work.
+
+```{r long only weight plot}
+long_only_weights$weight_plot
+```
+
+Switching to the short position, I'm following the same basic approach here by using the customized function to derive the necessary objects. The first five short position securities are shown below.
+
+```{r developing short weights}
+short_only_weights <- portfolio_weight_dev(data = company_log_betas,
+                                           position = "Short")
+
+short_only_weights$weights %>%
+  head() %>%
+  custom_kable()
+```
+
+The same criteria holds here where weights closer to zero are nearer to the SML while larger weights are further away. 
+
+```{r short only weight plot}
+short_only_weights$weight_plot
+```
+
+Putting both portfolio positions together, the weights for Long and Short displayed here. The proportion indicates that for every 1 share from the short side there should be about 1.284 shares being purchased for long.
+
+```{r short vs long weights}
+weights_and_proportions <- data.frame(
+  portfolio = c("Long", "Short", "Proportion"),
+  weight_value = c(long_only_weights$weighted_value, 
+                   short_only_weights$weighted_value,
+                   short_only_weights$weighted_value /
+                     long_only_weights$weighted_value)
+)
+
+weights_and_proportions %>%
+  custom_kable()
+```
+
+####How would you calculate the annual return of this portfolio?
+
+I've plotted both series below. The total trajectory line can be interpreted as the portfolio returns accruing across the year. The rolling returns can be found by dividing the total trajectory values by 250, which makes them daily values. 
+
+```{r total value trajectory plot}
+long_symbols <- long_only_weights$weights$symbol
+
+short_symbols <- short_only_weights$weights$symbol
+
+data.frame(
+  long_trajectory = as.matrix(sp500_2014[,-(1:3)])[,long_symbols] %*% 
+    long_only_weights$weights$weight,
+  short_trajectory = as.matrix(sp500_2014[,-(1:3)])[,short_symbols] %*% 
+    short_only_weights$weights$weight
+) %>%
+  mutate(Date = sp500_2014$Date,
+         total_trajectory = t(weights_and_proportions$weight_value[3] %*% 
+           long_trajectory - short_trajectory) %>% as.numeric(),
+         market_neutral_return = total_trajectory / 250) %>%
+  select(Date, total_trajectory, market_neutral_return) %>%
+  gather(key = "series", value = "value", -Date) %>%
+  ggplot(aes(Date, value, colour = series)) +
+  geom_line(size = 1.3, show.legend = F) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  facet_wrap(facets = "series", scales = "free") +
+  labs(title = "Trajectory for Value of Market-Neutral Portfolio",
+       subtitle = "Return derived by dividing neutral value by 250 (number of days)")
+```
+
+***
+
+##Part 2: Arbitrage Pricing Theory and Market-Neutral Portfolio
+
+***
+
+Starting the second part, I still have the same SP500 data loaded but, APT requires having all the each column be log differenced. For this, I've also dropped the Date, SPY, and Fed fund columns. 
+
+```{r apt set up}
+portfolio_returns <- sp500_2014 %>%
+  select(-Date, - SPY, -FFRate) %>%
+  mutate_all(function(x) c(0, diff(log(x)))) %>%
+  slice(-1)
+
+portfolio_returns %>%
+  select(1:5) %>%
+  head() %>%
+  custom_kable()
+```
+
+APT is a more complex modelling approach than CAPM. These are linear models that attempt to predict asset return while considering macroeconomic variables. In this case, theses outside variables will be estimated using the factor scores from a PCA on the SP stocks. As such, I've used `prcomp` below to do eigenvalue decomposition on the stock portfolio.
+
+####Factor Selection
+
+The factors here are derived using PCA,
+
+```{r apt pca}
+returns_pca <- prcomp(x = portfolio_returns)
+```
+
+An initial summary for the first ten principle components shows that PC1 explains about 30% of the set variance with diminishing explanations thereafter. All ten explain about 52% of variance in the set. This sets up that depending on the number of components picked going forward, there will be different variance explanations in the modelling work.
+
+```{r pca importance summary}
+pca_variance <- summary(returns_pca)$importance[,1:10] %>%
+  as.data.frame()
+  
+pca_variance %>%
+  custom_kable()
+```
+
+The factor loadings are of interest here as well. These are the eigenvector matrix for the set, the dimensions of which can be seen below. When converting the initial SP500 log differenced returns to factor scores, the eigencvector matrix is multiplied with the set. Additionally, the loadings provide insight into what information from the initial set is being carried in each principle component.
+
+```{r loadings dimension}
+data.frame(
+  dimension = c("rows", "columns"),
+  values = c(dim(returns_pca$rotation)[1], dim(returns_pca$rotation)[2])
+) %>% custom_kable()
+```
+
+####Create matrix of approximations of stock returns using a selected number of factors. Repeat analysis of approximations with several different numbers of selected factors.
+
+To conduct this analysis, I've developed a function that takes the pca object and creates the return approximations. These are developed by multiplying the factor scores by the transposed factor loadings. The similarity between the approximations and returns can be estimated using a simple linear regression where the actual portfolio returns are the outcome variable. The subsequent $R^2$ describes how much variance the approximations explain. I've repeated the approximations with four different factor selections to highlight that adding more increases the model $R^2$. As seen by the first five rows, the variance explanations vary as much 37% by adding more factors (Amazon).
+
+```{r developing determination coef for different returns}
+return_approximation <- function(pca_object, factor_n, col){
+  sp_factor_loadings <- pca_object$rotation[,1:factor_n]
+  
+  sp_factor_scores <- as.matrix(portfolio_returns) %*% 
+    as.matrix(sp_factor_loadings) %>%
+    as.data.frame()
+  
+  return_approximations <- as.matrix(sp_factor_scores) %*% t(sp_factor_loadings) %>%
+    as.data.frame()
+  
+  returns_lm <- lm(portfolio_returns[,col] ~ return_approximations[,col])
+  R_sq <- summary(returns_lm)$r.squared
+  
+  output <- list(
+    return_approx = return_approximations,
+    Rsq = R_sq
+  )
+  
+  return(output)
+}
+
+column_n <- seq(1, ncol(portfolio_returns), 1)
+
+determination_coefs <- data.frame(
+  stock = names(sp500_2014)[-1:-3],
+  five_R2 = map_dbl(column_n, function(x) 
+    return_approximation(pca_object = returns_pca, factor_n = 5, col = x)$Rsq),
+  ten_R2 = map_dbl(column_n, function(x) 
+    return_approximation(pca_object = returns_pca, factor_n = 10, col = x)$Rsq),
+  fifteen_R2 = map_dbl(column_n, function(x) 
+    return_approximation(pca_object = returns_pca, factor_n = 15, col = x)$Rsq),
+  twenty_R2 = map_dbl(column_n, function(x) 
+    return_approximation(pca_object = returns_pca, factor_n = 20, col = x)$Rsq)
+)
+
+determination_coefs %>%
+  head() %>%
+  custom_kable()
+```
+
+####What do you think about the quality of approximation? Is it consistent with the selected number of factors? What characteristic in the PCA output do you use in order to answer this question?
+
+I've plotted the determination coefficients below for the different factor choices. As the number of factors increases, the average $R^2$ rises as well. This is because there is more variance being captured by the principle components. Recalling the variance explanation table above, five principle components captures about 38% of the return variance while ten captures about 52%. Inherently, as this number goes towards the max component level, more variance is captured making the $R^2$ go up.
+
+```{r density of R2 approx}
+factor_R2 <- determination_coefs %>%
+  gather(key = "factor_R2", value = "R2", -stock) %>%
+  mutate(factor_R2 = factor(factor_R2, levels = c("five_R2", "ten_R2",
+                                                  "fifteen_R2", "twenty_R2")))
+  
+factor_R2 %>%
+  ggplot(aes(R2, colour = factor_R2, fill = factor_R2)) +
+  geom_density(size = 1.3, alpha = .05) +
+  scale_y_continuous(breaks = seq(0, 3, .5)) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange", 
+                                 "darkorchid", "forestgreen")) +
+  scale_fill_manual(values = c("dodgerblue2", "darkorange", 
+                                 "darkorchid", "forestgreen")) +
+  labs(title = "Determination coefficients for 5, 10, 15, and 20 factors",
+       subtitle = "More variance explanation is evident in larger factor number selection given more PCA information")
+```
+
+This trend is evident in the average $R^2$ captured by the different factor numbers where adding more factors increases variance explanation.
+
+```{r reviewing changing R2 with factor n}
+approx_means <- factor_R2 %>%
+  group_by(factor_R2) %>%
+  summarise(R2_mean = mean(R2))
+
+approx_means %>%
+  custom_kable()
+```
+
+Focusing on ten factors specifically, the approximation seems reasonable. As I've mentioned the return approximation $R^2$ can be compared to the PCA variance capture to evaluate if these numbers are consistent. In this case, they only differ by a few points so I think the approximations are good. 
+
+```{r ten factor density}
+factor_R2 %>%
+  filter(factor_R2 == "ten_R2") %>%
+  ggplot(aes(R2)) +
+  geom_density(size = 1.3, alpha = .05, 
+               colour = "dodgerblue2", fill = "dodgerblue2") +
+  geom_vline(xintercept = pca_variance$PC10[3], colour = "darkorange", size = 1.3) +
+  geom_vline(xintercept = approx_means$R2_mean[2], colour = "darkorchid", size = 1.3) +
+  scale_y_continuous(breaks = seq(0, 3, .5)) +
+  labs(title = "Five factor return approximations vs actual R2 density",
+       subtitle = "Average R2 (purple line) is close to PCA variance capture (orange line); approximation seems reasonable")
+```
+
+####Visualize approximations for several stocks
+
+So far, I've only evaluated the approximations at a high level but, each security has an $R^2$ for the approximation vs actual linear model. To highlight this, I've randomly selected nine stocks to assess how close the approximations are to the actual returns. When visualized, these nine appear to have reasonable fits. Amongst this group, YUM seems to have the least correlation.
+
+```{r reviewing approximated versus actual returns}
+set.seed(1017)
+random_stocks <- sample(x = names(sp500_2014)[-1:-3], size = 9, replace = F)
+
+return_approximation <- map(column_n, function(x) 
+  return_approximation(pca_object = returns_pca, 
+                       factor_n = 10, 
+                       col = x))
+
+portfolio_returns %>%
+  gather(key = "stock", value = "return") %>%
+  bind_cols(
+    return_approximation[[1]]$return_approx %>%
+      gather(key = "stock", value = "approx_return") %>%
+      select(-stock)
+  ) %>%
+  filter(stock %in% random_stocks) %>%
+  ggplot(aes(approx_return, return, colour = stock)) +
+  geom_point(show.legend = F, alpha = .5) +
+  geom_smooth(method = "lm", se = F, size = 1.3, colour = "darkgray") +
+  facet_wrap(facets = "stock", scales = "free") +
+  labs(title = "Apprximated vs actual returns for 9 SP500 stocks",
+       subtitle = "Values for approximation appear close to actuals; YUM appears to be the least similar here")
+```
+
+Confirming this, I've included the $R^2$ for each below. AMP has the highest value while YUM does indeed have the lowest.
+
+```{r looking at R2 for 9 stocks}
+determination_coefs %>%
+  select(stock, 
+         "R2" = ten_R2) %>%
+  filter(stock %in% random_stocks) %>%
+  arrange(desc(R2)) %>%
+  custom_kable()
+```
+
+####Beta Estimation
+
+The market betas are the ten factor loadings from the returns pca. This is essentially a mix of market information from the 297 stocks compressed into ten loadings.
+
+```{r return beta estimation}
+market_betas <- returns_pca$rotation[,1:10] %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Stock") %>%
+  mutate(Alpha = returns_pca$center %>% as.numeric()) %>%
+  select(Stock, Alpha, everything())
+
+market_betas %>%
+  select(-Alpha) %>%
+  head() %>%
+  custom_kable()
+```
+
+Visualizing the PCA loadings provides some insight into what they might represent. For example, the first shows all stocks as negative, which might signal they capture broad market decline between health and industrials. More widely, they may be signalling general market decline. The second is less clear with only Humana having a large positive spike.
+
+```{r market beta viz}
+gathered_betas <- market_betas %>%
+  select(-Alpha) %>%
+  slice(1:6) %>%
+  gather(key = "factor", value = "beta", -Stock) %>%
+  mutate(factor = factor(factor, levels = c(paste("PC", seq(1:10), sep = ""))))
+  
+gathered_betas %>%
+  ggplot(aes(factor, beta, colour = Stock, group = Stock)) +
+  geom_line(size = 1.3, alpha = .5) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkgray") +
+  labs(title = "Faceted bar charts for factor loadings from each principle component",
+   subtitle = "Plot highlights loadings to be used for factor naming: Ex. PCA1 as low market returns",
+   x = NULL)
+```
+
+I think the line plot is slightly busy so I've also included a faceted bar chart. This clearly shows each stocks relationship to the loadings. Here, it looks like PCA8 could be general market uptick in contrast to market down in PC1.
+
+```{r market beta viz 2}
+gathered_betas %>%
+  ggplot(aes(Stock, beta, fill = factor)) +
+  geom_col(show.legend = F) +
+  facet_wrap(facets = "factor", scales = "free") +
+  coord_flip() +
+  geom_hline(yintercept = 0, alpha = .5, size = 1.3, colour = "darkgray") +
+  labs(title = "Faceted bar charts for factor loadings from each principle component",
+     subtitle = "Plot highlights loadings to be used for factor naming: Ex. PCA1 as low market returns",
+     x = NULL)
+```
+
+####Estimation of market risk prices. Identify market prices of risk which are insignificant.
+
+I’ve included a model to estimate the market price of risk. This is formally called the equilibrium equation for APT. To construct the model, I’ll be using the PCA centres from the initial principle component work. In practice, these are equal to the intercepts from a linear model with stock returns against all ten principle components. 
+The model includes these pca centres minus the fed rate mean as the outcome with each security pca coefficient as the predictors. There are only two principle components that are not significant here (PCA6 & PCA8). Interestingly, I highlighted PCA8 as general market improvements but, it has  high p-value so is insignificant in the model. The other eight principle components are all significant. The slope coefficients here represent the market price of risk.
+
+```{r market risk prices}
+market_risk_price_lm <- lm(Alpha - fed_mean ~. -1, 
+                           data = market_betas[,-1])
+
+tidy(market_risk_price_lm) %>%
+  custom_kable()
+```
+
+The model shows an adjusted $R^2$ of .6261, which denotes it explains about 63% of the variance in the outcome. The model F-test would also reject the utility hypothesis at a 5% level highlighting that there is a significant relationship between the alpha and PCA inputs.
+
+```{r market risk lm metrics}
+data.frame(
+  metric = c("R2", "Adjusted R2", "F Stat"),
+  value = c(
+    summary(market_risk_price_lm)$r.squared,
+    summary(market_risk_price_lm)$adj.r.squared,
+    summary(market_risk_price_lm)$fstatistic[1]
+  ) %>% round(4)
+) %>% custom_kable()
+```
+
+The big output here though is the residuals. The idea is that the model provides insight into the difference between mean stock return and predicted value. A positive residual signals the stock is outperforming the model prediction and therefore, is a buy candidate. The opposite is also true with a negative residual signalling under performance and therefore, a sell opportunity. To review these, I've included a residual diagnostic plot below. The outputs appear normal and therefore in line with the regression assumption of IID residuals.
+
+```{r residual plot for market risk lm}
+autoplot(market_risk_price_lm)
+```
+
+Further solidifying this, I've included a histogram of the residuals to observe their shape. As seen, they appear to be reasonably normal.
+
+```{r market risk lm hist}
+market_risk_residuals <- data.frame(
+  index = seq(1, nrow(market_betas), 1),
+  resid = residuals(market_risk_price_lm)
+) %>%
+  mutate(stock = market_betas$Stock,
+         portfolio_position = ifelse(resid > 0, "Long", "Short"))
+
+market_risk_residuals %>%
+  ggplot(aes(resid)) +
+  geom_histogram(bins = 25, fill = "dodgerblue2") +
+  labs(title = "Histogram for market price residuals",
+       subtitle = "Residuals appear to be normally distributed")
+```
+
+In the previous step, I added variables to denote a long or short stock based on their residuals. Here, I've highlighted that for each bar. 
+
+```{r market risk residuals index plot}
+market_risk_residuals %>%
+  ggplot(aes(index, resid, fill = portfolio_position)) +
+  geom_col() +
+  scale_fill_manual(values = c("darkgoldenrod1", "dodgerblue2")) +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkgray") +
+  labs(title = "Equilibrium Model Residual Plot- Positive residuals signal buy opportunity, negative sell",
+       subtitle = "Long and short portfolios can be constructed using findings here",
+       fill = "Residual Type")
+```
+
+####Make recommendation for long portfolio according to APT for 2014
+
+Based on these, any of the positive residuals should be included in a long portfolio for 2014. I've split the long stocks into 12 groups based on residual size so all the 
+
+```{r long stock vis, fig.width=12, fig.height=8}
+position_groups <- paste("Tier", seq(1:12) %>% order(decreasing = T))
+
+long_apt_stocks_2014 <- market_risk_residuals %>%
+  filter(portfolio_position == "Long") %>%
+  mutate(group = cut_number(resid, 
+                            n = 12, 
+                            labels = position_groups),
+         group = factor(group, levels = position_groups[12:1]),
+         stock = reorder(stock, resid),
+         weight = resid / sum(resid))
+
+long_apt_stocks_2014 %>%
+  ggplot(aes(stock, resid, fill = group)) +
+  geom_col(show.legend = F) +
+  coord_flip() +
+  facet_wrap(facets = "group", scales = "free") +
+  labs(title = "Long stocks divided into 12 tiers- visualization provides insight into possible long positions for 2014",
+       subtitle = "Tier one shows the top 13 long stocks; AVGO highest long residual")
+```
+
+I've also included a listing of all the long stocks too.
+
+```{r long list}
+long_apt_stocks_2014$stock %>%
+  as.vector()
+```
+
+Following the same approach, I've included all the short positions here.
+
+```{r short stock vis, fig.width=12, fig.height=8}
+short_apt_stocks_2014 <- market_risk_residuals %>%
+  filter(portfolio_position == "Short") %>%
+  mutate(group = cut_number(resid, 
+                            n = 12, 
+                            labels = position_groups),
+         group = factor(group, levels = position_groups[12:1]),
+         stock = reorder(stock, resid),
+         weight = resid / sum(resid))
+
+short_apt_stocks_2014 %>%
+  ggplot(aes(stock, resid, fill = group)) +
+  geom_col(show.legend = F) +
+  coord_flip() +
+  facet_wrap(facets = "group", scales = "free") +
+  labs(title = "Short stocks divided into 12 tiers- visualization provides insight into possible short positions for 2014",
+       subtitle = "Tier one shows the top 12 short stocks; COL has the largest short residual")
+```
+
+
+```{r short list}
+short_apt_stocks_2014$stock %>%
+  as.vector()
+```
+
+With both long and short stocks identified, the respective position weights can be developed. The APT weights are displayed below.
+
+```{r long and short apt weight dev}
+long_apt_weights <- sp500_2014 %>%
+  select(-1:-3) %>%
+  slice(1) %>%
+  gather(key = "stock", value = "value") %>%
+  filter(stock %in% long_apt_stocks_2014$stock) %>%
+  mutate(weight = long_apt_stocks_2014$weight)
+
+short_apt_weights <- sp500_2014 %>%
+  select(-1:-3) %>%
+  slice(1) %>%
+  gather(key = "stock", value = "value") %>%
+  filter(stock %in% short_apt_stocks_2014$stock) %>%
+  mutate(weight = short_apt_stocks_2014$weight)
+
+apt_weights <- data.frame(
+  portfolio = c("Long", "Long sum", "Short", "Short sum", "Proportion"),
+  weight = c(sum(long_apt_weights$value * long_apt_weights$weight),
+             sum(long_apt_weights$weight),
+             sum(short_apt_weights$value * short_apt_weights$weight),
+             sum(short_apt_weights$weight),
+             sum(short_apt_weights$value * short_apt_weights$weight) /
+               sum(long_apt_weights$value * long_apt_weights$weight))
+)
+
+apt_weights %>%
+  custom_kable()
+```
+
+####Calculate and plot value the portfolio's value trajectory
+
+The APT market neutral value trajectory can be calculated using the weights and proportion from the previous chunk. Each portfolio position is multiplied by its respective weight to get the long and short trajectories. The total trajectory is then derived by multiplying the proportion by long minus short. I've visualized the line below alongside the portfolio returns. 
+
+```{r ap marekt neutral trajectory plot}
+apt_portfolio_trajectory <- data.frame(
+  long_trajectory = as.matrix(sp500_2014[,-(1:3)])[,long_apt_weights$stock] %*% 
+    long_apt_weights$weight,
+  short_trajectory = as.matrix(sp500_2014[,-(1:3)])[,short_apt_weights$stock] %*% 
+    short_apt_weights$weight
+) %>%
+  mutate(Date = sp500_2014$Date,
+         total_trajectory = t(apt_weights$weight[5] %*% 
+           long_trajectory - short_trajectory) %>% as.numeric(),
+         market_neutral_return = total_trajectory / 250) %>%
+  select(Date, total_trajectory, market_neutral_return)
+  
+apt_portfolio_trajectory %>%
+  gather(key = "series", value = "value", -Date) %>%
+  ggplot(aes(Date, value, colour = series)) +
+  geom_line(size = 1.3, show.legend = F) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  facet_wrap(facets = "series", scales = "free") +
+  labs(title = "Trajectory for Value of Market-Neutral Portfolio using APT weights",
+       subtitle = "Return derived by dividing neutral value by 250 (number of days)")
+```
+
+To confirm these values, I've included the first five rows.
+
+```{rap marekt neutral trajectory head}
+apt_portfolio_trajectory %>%
+  mutate_if(is.numeric, function(x) round(x, 7)) %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+##Part 3: Hedging Market-Neutral Portfolio
+
+***
+
+####Explore the relationship between SPY and the APT total trajectory. How strong is correlation and what is the expecation for regression fit?
+
+As a starting point, I've visualized the SPY and APT portfolio cumulative returns. Owing to different scales though, any association is masked.
+
+```{r cume return for spy and apt portfolio}
+apt_spy_cume <- data.frame(
+  Date = sp500_2014$Date,
+  spy_cume = mixed_portfolio$cume_return[mixed_portfolio$Security == "cume_spy_return"],
+  apt_total_cume = cumsum(c(0, diff(log(1 + apt_portfolio_trajectory$total_trajectory))))
+)
+
+apt_spy_cume %>%
+  gather(key = "portfolio", value = "cume_return", -Date) %>%
+  ggplot(aes(Date, cume_return, colour = portfolio)) +
+  geom_line(size = 1.3) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Cumulative returns for SPY & APT market neutral portfolio",
+       subtitle = "Both series have different scales so interpretation suffers")
+```
+
+A better representation can be found using a scatter plot. Here, there's a clear strong, positive trend that is slightly non-linear. As the cumulative returns for SPY increase, so do the APT returns. This means that the market neutral portfolio shows similar returns to SPY. With a correlation coefficient of .86, a simple linear regression model with the APT returns as the outcome would show a very good fit with a high $R^2$. While the association does have some non-linearity, the broad linear trend is still evident. However, there are variance gaps where the two do not align so a simple regression likely won't capture the association as strongly as needed.
+
+```{r apt vs spy plot}
+apt_spy_cume %>%
+  ggplot(aes(spy_cume, apt_total_cume)) +
+  geom_point(alpha = .7, colour = "dodgerblue2") +
+  geom_smooth(method = "loess", se = F, size = 1.3, colour = "darkorchid") +
+  labs(title = "Cumulative APT market neutral portfolio vs SPY",
+       subtitle = paste("Relationship appears to be positive and strong; Correlation:", cor(apt_spy_cume$spy_cume, apt_spy_cume$apt_total_cume) %>% round(2)))
+```
+
+###Hedging using regression
+
+As expected, a linear model between the two variables shows a highly significant slope and overall model p-value. The slope values provides the hedging ratio between the two series and indicates that for 1 unit of the portfolio, the hedge contains approximately -32 units of SPY.
+
+```{r hedge ratio modelling}
+hedge_ratio_lm <- lm(apt_total_cume ~ spy_cume- 1, data = apt_spy_cume)
+
+summary(hedge_ratio_lm)
+```
+
+####What can you tell about the assumptions of the the model?
+
+The model assumptions appear to be violated here. Given this is essentially a time series linear model, it isn't surprising to see serial auto correlation and pattern in the residuals. However, this does violate the IID residual assumption. Additionally, the QQ-norm plot shows there are fat tails but, they seem to be close to normal. Overall, there are some assumption violations here.
+
+```{r hedge ratio lm residual check}
+autoplot(hedge_ratio_lm)
+```
+
+###Hedging using cointegration
+
+Cointegration reviews if two time series move together but, vary along the way. The idea here is derived from a random walk where the two series are broadly going in the same direction, owing to some underlying structural connection, but aren’t necessarily taking the same path. Using the two portfolios here, the two classes are inherently part of the same market despite different compositions. With this, there’s an expectation that they should broadly be connected. This general intuition, coupled with the initial regression results indicating the series are closely related, suggest that doing cointegration modelling makes sense here.
+
+Formally, two series are said to be cointegrated if each of the series taken individually is unit-root non-stationary, while there exists some linear combination of the series which is stationary for some non-zero vector. This cointegration can be tested using the Johansen Test, which is conducted using the `ca.jo` function. The test operates by forming vectorized auto-regressive models (a combination of two time series with a matrix that stores coefficients) which are then differenced to derive a Vector Error Correction Model. The test checks for the situation of no cointegration, which occurs when the coefficients matrix is 0. Assessing this is done using eigenvalue decomposition of this matrix. During this, the matrix rank is reviewed to sequentially test whether this rank is equal to zero or one. The null hypothesis is that the rank is zero, meaning there is no cointegration. Setting the test up, I’ve included both cumulative return series, specified the eigenvalue decomposition, selected two lag checks for the test, and specified long run to construct the Vector Error Correction Model reviewed above.
+
+The initial summary provides some insight into the cointegration testing. The test values for $(r = 0)$, or no cointegration, shows the 10% and 5% levels as being significant. With this, the null hypothesis can be rejected. However, the second test, $(r \leq 1)$, shows a test statistic that is lower than all three confidence levels. In this case, the null cannot be rejected. Putting these both together, the cointegration order can be specified as 1, which means the rank of the coefficient matrix is one. Further, this means that a linear combination of both series should form a stationary series.
+
+```{r cointegration with portfolios}
+apt_spy_cume <- apt_spy_cume %>%
+  select(apt_total_cume, spy_cume, -Date)
+
+portfolio_johansen <- ca.jo(x = apt_spy_cume, 
+                            ecdet = "none", 
+                            type = "eigen", 
+                            K = 2, 
+                            spec = "longrun")
+
+summary(portfolio_johansen)
+```
+
+To highlight the test result, I've also visualized the result. It reaffirms the cointegration order is one.
+
+```{r visualizing johansen test}
+johansen_test_vals <- portfolio_johansen@cval %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "coint_test") %>%
+  mutate(test_stat = portfolio_johansen@teststat) %>%
+  select(coint_test, test_stat, everything())
+
+johansen_test_vals %>%
+  custom_kable()
+
+johansen_test_vals %>%
+  gather(key = "confidence_level", value = "value", -coint_test) %>%
+  mutate(confidence_level = factor(confidence_level, levels = c("test_stat", "10pct",
+                                                                "5pct", "1pct"))) %>%
+  ggplot(aes(confidence_level, value, fill = coint_test)) +
+  geom_col(show.legend = F) +
+  scale_fill_manual(values = c("darkorange", "dodgerblue2")) +
+  facet_wrap(facets = "coint_test") +
+  coord_flip() +
+  labs(title = "Johnasen Procedure for APT portfolio and SPY cumulative returns",
+       subtitle = "r = 0 test passes with 10% and 5% values lower than test while r = 1 does not pass; Therefore, cointegration = 1")
+```
+
+The residuals show that the first series may have some auto-correlation, especially in the first 60 days of 2014. This may cause stationarity issues but, overall the series should have statistical equilibrium. However, the second cannot be stationary given it is not a cointegration vector.
+
+```{r cointegration residuals}
+plotres(portfolio_johansen)
+```
+
+The hedging ratio for each cointegration series is found using the V matrix, which is  the eigen vector matrix normalized to the first column. As seen, the hedging ratio for the first cointegration vector is -11.434. Implicitly, this should be the cointegration vector given the test result but, I'll review the stationarity for both.
+
+```{r v table}
+portfolio_johansen@V %>%
+  custom_kable()
+```
+
+From a visual perspective, both cointegration mixtures can be evaluated by reviewing if they have broad statistical equilibrium. These series are derived by multiplying SPY's cumulative return with the normalized eigen vector values from above.  These linear combinations form the model residuals for the cointegration. Zt1 appears to be stationary given the series below. That said, the first 60 days seem slightly more erratic.
+
+```{r zt vis}
+coint_series <- data.frame(
+  zt1 = as.matrix(apt_spy_cume) %*% portfolio_johansen@V[,1],
+  zt2 = as.matrix(apt_spy_cume) %*% portfolio_johansen@V[,2]
+) %>%
+  mutate(index = row_number())
+
+coint_series %>%
+  gather(key = "series", value = "value", -index) %>%
+  ggplot(aes(index, value, colour = series)) +
+  geom_line(size = 1.3, alpha = .7) +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Series from linear combinations using cointegration eigenvector coefficients",
+       subtitle = "Zt1 is stationary given the cointegration order = 1")
+```
+
+More formally, these can be tested by reviewing the roots for the characteristic equation. I've done this for the full Zt1 and a series with the first 60 days removed. Both circles are outside the unit circle indicating they are both stationary. The series with 60 days removed also shows a distance further from the circle indicating that process helped move it away from the non-stationary territory. The final series, Zt2, is also outside the unit circle showing it's technically stationary. However, it's less so than the initial cointegration mix making the first one preferable. Given this, the hedging ratio is from Zt1, which is 1, -11.434.
+
+```{r unit root test, , fig.width=12, fig.height=8}
+zar_full <- ar(coint_series$zt1,  aic = TRUE ,method = "yule-walker")
+
+zar_shortened <- ar(coint_series$zt1[-(1:60)],  aic = TRUE, method = "yule-walker")
+
+zar2 <- ar(coint_series$zt2,  aic = TRUE ,method = "yule-walker")
+
+par(mfrow = c(3, 2), cex = 0.9)
+armaRoots(zar_full$ar,lwd = 8, n.plot = 400, digits = 8)
+armaRoots(zar_shortened$ar,lwd = 8, n.plot = 400, digits = 8)
+armaRoots(zar2$ar,lwd = 8, n.plot = 400, digits = 8)
+```
+
+When reviewing residuals from both models, it's clear that Zt1 has the most appropriate fit here. Interestingly, the regression model and Zt2 look quite similar.
+
+```{r final residual plot for hedging, warning=FALSE}
+coint_series <- coint_series %>%
+  mutate(regression = hedge_ratio_lm$residuals)
+
+coint_series %>%
+  gather(key = "series", value = "residuals", -index) %>%
+  mutate(series = factor(series, levels = c("zt1", "zt2", "regression"))) %>%
+  ggplot(aes(index, residuals, colour = series)) +
+  geom_line(size = 1.3, alpha = .7) +
+  scale_y_continuous(breaks = seq(-4, 4, 1)) +
+  scale_colour_manual(values = c("forestgreen", "darkorange", "dodgerblue2")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  labs(title = "Residuals for cointegration and regression model",
+       subtitle = "Series Zt1 shows most appropriate model fit given narrowest residual band")
+```
+
+This is confirmed when looking at both hedging ratios
+
+```{r hedging ratio compare for zt2 and regression}
+data.frame(
+  model = c("regression", "zt2"),
+  hedge_ratio = c(hedge_ratio_lm$coefficients %>% as.numeric(), 
+                  portfolio_johansen@V[4] %>% abs())
+) %>% custom_kable()
+```
+
+
+####Compute summary statistics for series residuals. Zt1 is shifted relative to zero- Do you see this as a problem?
+
+As a final step I've computed the summary statistics, which reaffirm the visual assessment of residuals. Here, Zt1 has the lowest residual standard deviation confirming it as the most appropriate fit.
+
+```{r hedging summary stats}
+series_sd <- coint_series %>%
+  select(-index) %>%
+  map_dbl(.f = sd)
+  
+coint_series %>%
+  select(-index) %>%
+  apply(. , 2, summary) %>%
+  rbind(sd = series_sd) %>%
+  custom_kable()
+```
+
+The relative residual shift to zero isn't worrying here. All this means is that the residuals have been transformed by subtracting the minimum from each value. This transformation doesn't inherently affect the standard deviation given the average distance from the mean doesn't change. I've highlighted this below by changing all the series residuals relative to zero. As seen, the standard deviation doesn't change. With this, Zt1 one is still the preferable modelling choice.
+
+```{r reviewing zero shift}
+series_sd <- coint_series %>%
+  select(-index) %>%
+  mutate_all(function(x) x - min(x)) %>%
+  map_dbl(.f = sd)
+
+coint_series %>%
+  select(-index) %>%
+  mutate_all(function(x) x - min(x)) %>%
+  apply(. , 2, summary) %>%
+  rbind(sd = series_sd) %>%
+  custom_kable()
+```
+
+***

@@ -1,0 +1,250 @@
+---
+title: "Options Greeks in R"
+author: "Mark Preston"
+date: "March 1, 2019"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##CME options profit & loss using Greeks
+
+This week, I'll be looking at options pricing. Specifically, the work will evaluate put options pricing while also using Greeks to construct profit and loss estimates. To start, I've loaded the data. The main focus here is the P1425 column, which tracks the put values for an option with a 1425 strike. the set spans most of 2007, though it starts in late February. The underlying price is for futures ticker is ESZ7, which is traded on the S&P 500 e-mini options at the CME.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(RQuantLib)
+library(kableExtra)
+library(knitr)
+
+#setting prefered ggplot theme
+theme_set(
+  theme_minimal()
+)
+
+colours <- c("dodgerblue2", "darkorange", "darkorchid3", "forestgreen")
+
+#custom table function used throughout analysis
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+options_price <- read.csv("OptionsPrices.csv", stringsAsFactors = F) %>%
+  mutate(Date = as.Date(Date, format = "%m / %d / %Y"))
+
+options_price %>%
+  select(1:4, 27) %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+###Calculate the P&L breakdown into delta, gamma and vega components for 1425 strike for each day between 2/26/2007 and 3/6/2007
+
+The ultimate goal here is collecting the put options Greeks for a specified date range. However, some initial work has to be developed prior to this. Starting here, the `EuropeanOption` function requires a volatility measure. The implied volatility is a measure of future variability for an underlying asset which option contract is based on. Essentially it's the stock's standard deviation ($\sigma$), which is a necessary part of the Black-Scholes-Merton formula. With this in mind, I've collected the implied volatility for each day in the set using `map`. Each daily record for option price and underlying price, dividend and risk-free rate as well as the maturity is provided for the function. This yields a new data frame with 209 daily implied volatilities.
+
+```{r collecting implied volatilities}
+all_option_days <- seq(1, nrow(options_price), 1)
+
+p1425_put_history <- list(
+  Date = options_price$Date,
+  implied_vol =
+    map(all_option_days, function(x)
+         EuropeanOptionImpliedVolatility(type = "put",
+                                         value = options_price$P1425[x],
+                                         underlying = options_price$UndPr[x], 
+                                         strike = 1425, 
+                                         dividendYield = options_price$OptRate[x], 
+                                         riskFreeRate = options_price$OptRate[x], 
+                                         maturity = options_price$Expiry[x] / 365, 
+                                         volatility = .3) %>% as.numeric()
+         )
+     ) %>% 
+  map_df(unlist)
+
+p1425_put_history %>% 
+  head() %>%
+  custom_kable()
+```
+
+This is the only parameter I needed to derive for the options pricing function. While the set contains the actual options price, my aim here is to collect the options Greeks to use for P&L construction. To this end, I've collected every daily put pricing summary in a list using `map`. To highlight the method, I've included the first element from the list (denoted by `[[1]]`). This shows all the put metrics, including the three Greeks I'll be using for the P&L estimates ($\Delta, \Gamma, v$). Given I need these values for several days, they are now stored in the list object for later use.
+
+```{r collecting all daily put summaries}
+daily_P1425_put <- map(all_option_days, function(x) 
+  EuropeanOption(type = "put", 
+                 underlying = options_price$UndPr[x], 
+                 strike = 1425, 
+                 dividendYield = options_price$OptRate[x], 
+                 riskFreeRate = options_price$OptRate[x], 
+                 maturity = options_price$Expiry[x] / 365, 
+                 volatility = p1425_put_history$implied_vol[x])
+  )
+
+daily_P1425_put[[1]] %>%
+  unlist() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "put metric") %>%
+  rename(value = ".") %>%
+  mutate(value = round(value, 4)) %>%
+  custom_kable()
+```
+
+Moreover, I wanted to track put value across the series as well. I've extracted these values from the list object from the previous section. Following this, I've constructed a plot with implied volatility and put value across the 2007 time series. One expectation here is declining put value closer to expiration. This is because there is less chance that the option will be in the money if taken only a few days before expiry. Of note, implied volatility also rises as expiration comes closer here as well.
+
+```{r reviewing put history}
+p1425_put_history <- p1425_put_history %>%
+  mutate(put_value = map(all_option_days, 
+                         function(x) daily_P1425_put[[x]]$value) %>% unlist())
+
+p1425_put_history %>%
+  gather(key = "variable", value = "value", -Date) %>%
+  ggplot(aes(Date, value, colour = variable)) +
+  geom_point(show.legend = F) +
+  facet_wrap(facets = "variable", scales = "free", ncol = 1) +
+  scale_colour_manual(values = colours) +
+  labs(title = "Implied volatility and put value for ESZ7",
+       subtitle = "Put value declines as expiry becomes closer; implied volatilty and value appear inversely correlated to an extent")
+```
+
+At this stage, I've got the necessary parameters to start constructing the P&L using Greeks. As such, I've collected the Greeks for seven days below. Before moving on, I've also defined the Greeks below:
+
+- **Delta:** Measures the rate of change in an option price given an increase in the underlying asset price. This is essentially a slope coefficient. Commonly, delta is used when determining the likelihood of an option being in-the-money at expiration.
+
+- **Gamma:** Masures the rate of change of Delta, which is how much an option price changes given a one-point movement in the underlying asset. Delta increases or decreases along with the underlying asset price, whereas Gamma is a constant that measures the rate of change of Delta (see table below for an example of an in-the-money call option.
+
+- **Vega:** Measures the rate of change in the implied volatility of an option or position. Implied volatility is the expected volatility of the underlying asset over the life of the option – not the current or historical volatility of the asset. In particular, Vega shows traders how much an option price will change for each 1% move in implied volatility (Investopedia, 2019).
+
+Each of these values is visualized across all seven days below.
+
+```{r put greeks collection}
+seven_day_greeks <- map(1:7, function(x)
+  daily_P1425_put[[x]][1:4] %>% unlist() %>% as.vector()
+) %>% 
+  data.frame() %>%
+  gather(key = "variable", value = "greek_value") %>%
+  mutate(Date = rep(p1425_put_history$Date[1:7], each = 4),
+         variable = rep(c("put_value", "delta", "gamma", "vega"), times = 7),
+         variable = factor(variable, levels = c("put_value", "delta", 
+                                                "gamma", "vega")))
+
+seven_day_greeks %>%
+  ggplot(aes(Date, greek_value, colour = variable)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "variable", scales = "free") +
+  scale_colour_manual(values = colours) +
+  labs(title = "Options greeks and put value for ESZ7 from Feb. 26, 2007 to Mar. 6, 2007")
+```
+
+As an intermediate step, I've constructed a new data frame with the Greeks in a different format. Each day is a column while the rows correspond to options Greeks or put value. This will be used for the P&L development.
+
+```{r spread greeks}
+spread_greeks <- seven_day_greeks %>%
+  spread(key = "Date", value = "greek_value")
+
+spread_greeks %>%
+  custom_kable()
+```
+
+To effectively collect all the Greeks, I've developed a function. `grrek_estimated_pnl` conducts all the necessary delta, gamma, and Vega calculations for P&L estimation. Further, with these values derived, the P&L calculation is made. The output is a named numeric vector with all the necessary values. The output for February 26 is shown below highlighting the estimate is within a few decimals of the actual.
+
+```{r greek pnl collection}
+greek_estimated_pnl <- function(date, t, t2){
+  greeks <- spread_greeks %>%
+    select(date) %>%
+    slice(2:4) %>%
+    t() %>%
+    as.vector()
+  
+  delta <- greeks[1] * (options_price$UndPr[t2] - options_price$UndPr[t])
+  
+  gamma <- .5 * greeks[2] * (options_price$UndPr[t2] - options_price$UndPr[t]) ^ 2
+  
+  vega <- greeks[3] * 
+    (p1425_put_history$implied_vol[t2] - p1425_put_history$implied_vol[t]) 
+  
+  pnl_estimate <- sum(delta, gamma, vega)
+  
+  pnl_actual <- options_price$P1425[t2] - options_price$P1425[t]
+  
+  diff <- pnl_actual - pnl_estimate
+  
+  pnl_greeks <- c(pnl_actual = pnl_actual,
+                  pnl_estimate = pnl_estimate,
+                  difference = diff,
+                  delta = delta,
+                  gamma = gamma,
+                  vega = vega)
+  
+  return(pnl_greeks)
+}
+
+dates <- c(names(spread_greeks)[2],
+           names(spread_greeks)[3],
+           names(spread_greeks)[4],
+           names(spread_greeks)[5],
+           names(spread_greeks)[6],
+           names(spread_greeks)[7],
+           names(spread_greeks)[8])
+
+t <- seq(1, 7, 1)
+
+t2 <- seq(2, 8, 1)
+
+p1425_pnl <- map2(t, t2, function(x, y) 
+  greek_estimated_pnl(date = dates[x], t = x, t2 = y))
+
+p1425_pnl[[1]] %>%
+  data.frame() %>%
+  rename_all(function(x) 
+    str_replace(string = x, pattern = ".", replacement = "value")) %>%
+  custom_kable()
+```
+
+To formalize the review for all seven days, I've included each output in a table below. The Greek P&L estimates are all quite close to the actuals.
+
+```{r reviewing greek pnl estimates}
+greek_pnl <- rbind(p1425_pnl[[1]], p1425_pnl[[2]], p1425_pnl[[3]], 
+                   p1425_pnl[[4]], p1425_pnl[[5]], p1425_pnl[[6]], 
+                   p1425_pnl[[7]]) %>%
+  as.data.frame() %>%
+  mutate_all(function(x) round(x, 4)) %>%
+  mutate(Date = names(spread_greeks)[2:8]) %>%
+  select(Date, everything())
+
+greek_pnl %>% 
+  custom_kable()
+```
+
+Visualizing these helps solidify this point. The Greek estimation approach here is very close to the actual P&L values.
+
+```{r visualizing greek pnl estimates}
+greek_pnl %>%
+  select(Date, pnl_actual, pnl_estimate) %>%
+  gather(key = "PNL", value = "value", -Date) %>%
+  mutate(Date = factor(Date, levels = dates[order(dates, decreasing = T)])) %>%
+  ggplot(aes(Date, value, fill = PNL)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(breaks = seq(-30, 30, 5)) +
+  labs(title = "Profit and loss values for put option from Feb. 26, 2007 to Mar. 6, 2007",
+       subtitle = "Estimates derived using delta, gamma, and vega congruent with actual put P&L",
+       x = NULL,
+       y = "Profit & Loss Value",
+       fill = "PNL Type")
+```
+
+***
+
+###References
+
+####Options Greeks
+
+####Access: https://www.investopedia.com/university/option-greeks/
+
+***
